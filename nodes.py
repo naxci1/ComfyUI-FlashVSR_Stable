@@ -47,6 +47,9 @@ def tensor2video(frames: torch.Tensor):
 def largest_8n1_leq(n):  # 8n+1
     return 0 if n < 1 else ((n - 1)//8)*8 + 1
 
+def next_8n5(n):  # next 8n+5
+    return 21 if n < 21 else ((n - 5 + 7) // 8) * 8 + 5
+
 def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
     if w0 <= 0 or h0 <= 0:
         raise ValueError("invalid original size")
@@ -244,11 +247,9 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     _device = pipe.device
     dtype = pipe.torch_dtype
 
-    if frames.shape[0] < 21:
-        add = 21 - frames.shape[0]
-        last_frame = frames[-1:, :, :, :]
-        padding_frames = last_frame.repeat(add, 1, 1, 1)
-        _frames = torch.cat([frames, padding_frames], dim=0)
+    add = next_8n5(frames.shape[0]) - frames.shape[0]
+    padding_frames = frames[-1:, :, :, :].repeat(add, 1, 1, 1)
+    _frames = torch.cat([frames, padding_frames], dim=0)
         
     if tiled_dit:
         N, H, W, C = _frames.shape

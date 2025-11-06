@@ -40,9 +40,9 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git
 python -m pip install -r ComfyUI-FlashVSR_Ultra_Fast/requirements.txt
 ```
-> 📢: 要在RTX20系或更早的GPU上运行, 请安装`triton<3.3.0`:  
+📢: 要在RTX20系或更早的GPU上运行, 请安装`triton<3.3.0`:  
 
-> ```bash
+```bash
 # Windows
 python -m pip install -U triton-windows<3.3.0
 # Linux
