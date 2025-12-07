@@ -415,9 +415,9 @@ class FlashVSRNodeInitPipe:
                     "default": device_choices[0],
                     "tooltip": "Device to load the weights, default: auto (CUDA if available, else CPU)"
                 }),
-                "attention_mode": (["sparse_sage_attention", "block_sparse_attention"], {
+                "attention_mode": (["sparse_sage_attention", "block_sparse_attention", "flash_attention_2", "sdpa"], {
                     "default": "sparse_sage_attention",
-                    "tooltip": '"sparse_sage_attention" is available for sm_75 to sm_120\n"block_sparse_attention" is available for sm_80 to sm_100'
+                    "tooltip": 'Attention backend selection. "sparse_sage" and "block_sparse" use sparse masks. "flash_attention_2" and "sdpa" use dense attention (potentially slower but higher VRAM usage).'
                 }),
             }
         }
@@ -440,10 +440,7 @@ class FlashVSRNodeInitPipe:
             # Enforce physical VRAM limit?
             # torch.cuda.set_per_process_memory_fraction(1.0)
             
-        if attention_mode == "sparse_sage_attention":
-            wan_video_dit.USE_BLOCK_ATTN = False
-        else:
-            wan_video_dit.USE_BLOCK_ATTN = True
+        wan_video_dit.ATTENTION_MODE = attention_mode
 
         # Auto bfloat16 detection
         if precision == "auto":
