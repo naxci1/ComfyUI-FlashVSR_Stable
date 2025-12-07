@@ -368,6 +368,20 @@ class FlashVSRTinyLongPipeline(BasePipeline):
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
         self.load_models_to_device(["dit"])
         self.dit.LQ_proj_in.to(self.device)
+        # TCDecoder is needed during decoding loop, but can be loaded later if VRAM is tight?
+        # In tiny-long, decode happens inside the loop. So we need it.
+        # But maybe we can unload DiT?
+        # Wait, the loop alternates inference (DiT) and decode (TCDecoder).
+        # So we need both? No, inference produces latents, then we decode those latents.
+        # But here, we do it in a streaming fashion:
+        #   Process Chunk (Inference) -> Decode Chunk -> Output
+        # So we need both loaded for the loop unless we constantly swap (bad for speed).
+        # However, for 16GB VRAM, constant swapping might be the only way to support large frames if both don't fit?
+        # But TCDecoder is small compared to VAE. It's not the VAE. It's TCDecoder.
+        # TCDecoder is small. VAE is big.
+        # FlashVSRTinyLongPipeline uses TCDecoder, not VAE for decode?
+        # Yes: self.TCDecoder.decode_video
+        # So TCDecoder is likely fine to keep.
         self.TCDecoder.to(self.device)
 
         # 清理可能存在的 LQ_proj_in cache

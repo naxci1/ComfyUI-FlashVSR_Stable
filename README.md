@@ -3,6 +3,11 @@ Running FlashVSR on lower VRAM without any artifacts.
 
 ## Changelog
 
+#### 08.12.2025
+- **Optimization**: Ported all VRAM optimizations and Tiled VAE support to `tiny-long` mode, ensuring feature parity across all modes.
+- **Performance**: Optimized for Windows environments (speed improvements).
+- **Update**: General codebase cleanup and synchronization.
+
 #### 07.12.2025
 - **VRAM Optimization**: Implemented auto-fallback for `process_chunk`. If OOM occurs, it automatically retries with `tiled_vae=True` and then `tiled_dit=True`, preventing crashes.
 - **Critical Fix**: Fixed a bug in the non-tiled processing path where output was undefined.
