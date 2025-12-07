@@ -4,59 +4,74 @@ Running FlashVSR on lower VRAM without any artifacts.
 ## Changelog
 
 #### 07.12.2025
-- **Bug Fix**: Fixed the progress bar to correctly display status in ComfyUI using the `cqdm` wrapper.
+- **Bug Fix**: Fixed the progress bar to correctly display status in ComfyUI using the `cqdm` wrapper. Added text-based progress bar to logs.
+- **Sync**: Enabled VAE spatial tiling for `tiny` mode, bringing VRAM savings from `tiny-long` to the standard fast pipeline.
+- **Documentation**: Expanded tooltips for all node parameters and added detailed usage instructions to README.
 - **New Feature**: Added `frame_chunk_size` option to split large videos into chunks, enabling processing of large files on limited VRAM by offloading to CPU.
-- **Enhancement**: Improved logging to show detailed resource usage (RAM, Peak VRAM, per-step timing) when `enable_debug` is active.
+- **Enhancement**: Improved logging to show detailed resource usage (RAM, Peak VRAM, per-step timing) and model configuration details.
 - **Optimization**: Added `torch.cuda.ipc_collect()` for better memory cleanup.
 - **New Feature**: Added `attention_mode` selection with support for `flash_attention_2`, `sdpa`, `sparse_sage`, and `block_sparse` backends.
-- **New Feature**: Implemented VAE spatial tiling to reduce VRAM usage during decoding (experimental).
 - **Refactor**: Cleaned up code and improved error handling for imports.
 
 #### 06.12.2025
 - **Bug Fix**: Fixed a shape mismatch error for small input frames by implementing correct padding logic.
 - **Optimization**: VRAM is now immediately freed at the start of processing to prevent OOM errors.
-- **New Feature**: Added `enable_debug` option for extensive logging (input shapes, tile stats, VRAM usage, processing time).
-- **New Feature**: Added `keep_models_on_cpu` option to keep models in RAM (CPU) instead of VRAM, which is useful for GPUs with limited VRAM (e.g., 16GB).
-- **Enhancement**: Added accurate FPS calculation and peak VRAM reporting (using `max_memory_reserved`) to the logs.
-- **Optimization**: Replaced `einops` operations with native PyTorch ops for potential performance gains.
-- **Optimization**: Added "Conv3d memory workaround" for improved compatibility with newer PyTorch versions.
+- **New Feature**: Added `enable_debug` option for extensive logging.
+- **New Feature**: Added `keep_models_on_cpu` option to keep models in RAM (CPU) instead of VRAM.
+- **Enhancement**: Added accurate FPS calculation and peak VRAM reporting.
+- **Optimization**: Replaced `einops` operations with native PyTorch ops.
+- **Optimization**: Added "Conv3d memory workaround".
 
 #### 24.10.2025
 - Added long video pipeline that significantly reduces VRAM usage when upscaling long videos.
 
 #### 22.10.2025
-- Replaced `Block-Sparse-Attention` with `Sparse_Sage`, removing the need to compile any custom kernels.  
+- Replaced `Block-Sparse-Attention` with `Sparse_Sage`.
 - Added support for running on RTX 50 series GPUs.
 
 #### 21.10.2025
-- Initial release of this project, introducing features such as `tile_dit` to significantly reduce VRAM usage.
+- Initial release of this project.
 
 ## Preview
 ![](./img/preview.jpg)
 
-## Usage
-- **mode:**  
-`tiny` -> faster (default); `full` -> higher quality  
-- **scale:**  
-`4` is always better, unless you are low on VRAM then use `2`    
-- **color_fix:**  
-Use wavelet transform to correct the color of output video.  
-- **tiled_vae:**  
-Set to True for lower VRAM consumption during decoding at the cost of speed.  
-- **tiled_dit:**  
-Significantly reduces VRAM usage at the cost of speed.
-- **tile\_size, tile\_overlap**:  
-How to split the input video.  
-- **unload_dit:**  
-Unload DiT before decoding to reduce VRAM peak at the cost of speed.  
-- **frame_chunk_size**:
-Split processing into chunks of N frames to save VRAM. 0 = Process all frames at once.
-- **enable_debug:**  
-Enable extensive logging for debugging purposes. Displays detailed information about device status, input dimensions, and per-tile processing statistics.
-- **keep_models_on_cpu:**  
-If enabled, models will be moved to RAM (CPU) after processing instead of remaining in VRAM. This helps prevent OOM errors on systems with limited VRAM.
-- **attention_mode:**
-Select the attention backend. Options include `sparse_sage`, `block_sparse`, `flash_attention_2` (requires `flash-attn`), and `sdpa` (PyTorch default).
+## Performance & VRAM Optimization
+
+This node is optimized for various hardware configurations. Here are some guidelines:
+
+### VRAM Tiers & Settings
+
+| VRAM | Mode | Tiling | Chunk Size | Precision | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **24GB+** | `full` or `tiny` | Disabled | 0 (All) | `bf16`/`auto` | Max quality/speed. |
+| **16GB** | `tiny` | `tiled_vae=True` | 0 or ~100 | `bf16`/`auto` | Enable `keep_models_on_cpu`. |
+| **12GB** | `tiny` | `tiled_vae=True`, `tiled_dit=True` | ~50 | `fp16` | Use `sparse_sage` attention. |
+| **8GB** | `tiny-long` | **Required** | ~20 | `fp16` | Must use tiling and chunking. |
+
+### Performance Enhancements
+- **Attention Mode**: Use `sparse_sage_attention` for the best balance of speed and memory. `flash_attention_2` is faster but requires specific hardware/installation.
+- **Precision**: `bf16` (BFloat16) is recommended for RTX 3000/4000/5000 series. It is faster and preserves dynamic range better than `fp16`.
+- **Chunking**: Use `frame_chunk_size` to process videos in segments. This moves processed frames to CPU RAM, preventing VRAM saturation on long clips.
+
+## Node Features
+
+Hover over any input in ComfyUI to see these details:
+
+- **model**: Select the FlashVSR model version.
+- **mode**:
+  - `tiny`: Standard fast mode. Now supports VAE tiling.
+  - `tiny-long`: Streaming mode for very long videos. Lowest VRAM spike.
+  - `full`: Uses the full VAE encoder (optional). Highest VRAM.
+- **scale**: Upscaling factor (2x or 4x).
+- **color_fix**: Corrects color shifts using wavelet transfer. Highly recommended.
+- **tiled_vae**: Spatially splits frames during decoding. Saves massive VRAM at the cost of speed.
+- **tiled_dit**: Spatially splits frames during diffusion. Crucial for large resolutions (e.g. 4k output).
+- **tile_size / overlap**: Controls tile granularity. Smaller tiles = less VRAM but slower.
+- **unload_dit**: Aggressively unloads the DiT model before VAE decode.
+- **frame_chunk_size**: Splits the temporal dimension. Process N frames at a time.
+- **enable_debug**: Prints detailed per-step logs, VRAM stats, and timing to the console.
+- **keep_models_on_cpu**: Offloads models to system RAM when idle.
+- **attention_mode**: Selects the underlying attention kernel.
 
 ## Installation
 

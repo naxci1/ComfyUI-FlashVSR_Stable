@@ -66,9 +66,6 @@ def model_download(model_name="JunhaoZhuang/FlashVSR"):
         snapshot_download(repo_id=model_name, local_dir=model_dir, local_dir_use_symlinks=False, resume_download=True)
 
 def tensor2video(frames: torch.Tensor):
-    # Replaced einops with native PyTorch
-    # video_permuted = rearrange(video_squeezed, "C F H W -> F H W C")
-    # frames: (1, C, F, H, W) -> squeeze(0) -> (C, F, H, W)
     video_squeezed = frames.squeeze(0)
     video_permuted = video_squeezed.permute(1, 2, 3, 0) # C F H W -> F H W C
     video_final = (video_permuted.float() + 1.0) / 2.0
@@ -85,9 +82,6 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: i
         raise ValueError("invalid original size")
 
     sW, sH = w0 * scale, h0 * scale
-    
-    # Calculate target dimensions by rounding up to the nearest multiple
-    # This ensures we always pad instead of crop, preserving all content
     tW = math.ceil(sW / multiple) * multiple
     tH = math.ceil(sH / multiple) * multiple
     
@@ -100,10 +94,6 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
     sW, sH = w0 * scale, h0 * scale
     upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
     
-    # Lossless padding: if scaled size is different from target, we pad/crop.
-    # Since we changed tW/tH to be round UP, sW <= tW and sH <= tH.
-    # So we should only need padding.
-    
     if sW < tW or sH < tH:
         pad_l = max(0, (tW - sW) // 2)
         pad_r = max(0, tW - sW - pad_l)
@@ -111,7 +101,6 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
         pad_b = max(0, tH - sH - pad_t)
         upscaled_tensor = F.pad(upscaled_tensor, (pad_l, pad_r, pad_t, pad_b), mode='constant', value=0)
     
-    # Just in case tW/tH calculation was different (e.g. smaller), we keep cropping logic for safety
     l = max(0, (upscaled_tensor.shape[3] - tW) // 2)
     t = max(0, (upscaled_tensor.shape[2] - tH) // 2)
     cropped_tensor = upscaled_tensor[:, :, t:t + tH, l:l + tW]
@@ -236,6 +225,9 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none"):
     pipe.load_models_to_device(["dit","vae"])
     pipe.offload_model()
 
+    log(f"Pipeline Initialized: Mode={mode}, Device={device}, Dtype={dtype}, Attention={wan_video_dit.ATTENTION_MODE}", message_type='info', icon="🔧")
+    log(f"Model: {model}, VAE: {'Built-in' if alt_vae == 'none' else alt_vae}", message_type='info', icon="📦")
+
     return pipe
 
 class cqdm:
@@ -280,14 +272,29 @@ class cqdm:
                 self.pbar.update(1)
             
             self.step_idx += 1
+
+            # Show a text progress bar in the log
+            perc = (self.step_idx / self.total) * 100
+            bar_len = 20
+            filled = int(bar_len * self.step_idx // self.total)
+            bar = '█' * filled + '-' * (bar_len - filled)
+
+            msg = f"[{self.desc}] {self.step_idx}/{self.total} [{bar}] {perc:.1f}%"
+
             if self.enable_debug:
                 step_end = time.time()
                 step_time = step_end - step_start
-                # log(f"[{self.desc}] Step {self.step_idx}/{self.total} completed in {step_time:.4f}s", message_type='info', icon="⏱️")
-                # More detailed stats can be added here if needed, but logging resource usage every step might be too much spam.
-                # However, the user asked for "show each process" and "detailed logging".
-                # To avoid excessive spam, we'll log resource usage only if enable_debug is strictly True.
-                log_resource_usage(prefix=f"{self.desc} Step {self.step_idx}/{self.total}")
+                msg += f" | {step_time:.2f}s/step"
+                log_resource_usage(prefix=msg)
+            else:
+                # Always log progress if requested, but maybe less verbose?
+                # User said "Show a progress bar for every action in the log."
+                # Printing every step might span console.
+                # Use \r to overwrite? ComfyUI console usually supports it but logging function might print newline.
+                # 'log' function prints with flush=True.
+                print(f"\r{msg}", end="", flush=True)
+                if self.step_idx == self.total:
+                    print() # Newline at end
 
             return val
         except StopIteration:
@@ -334,7 +341,6 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         
         log(f"Starting Tiled Processing: {len(tile_coords)} tiles", message_type='info', icon="🚀")
         
-        # Instantiate cqdm with enable_debug passed correctly
         for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc="Processing Tiles", enable_debug=enable_debug)):
             tile_start = time.time()
             if enable_debug:
@@ -352,7 +358,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
                     LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                     topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
                     color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload,
-                    enable_debug_logging=enable_debug # Pass debug flag if supported by pipe
+                    enable_debug_logging=enable_debug
                 )
             except torch.OutOfMemoryError as e:
                 log(f"OOM during Tiled Processing! Try reducing tile_size or enabling tiled_vae if not enabled.", message_type='error', icon="❌")
@@ -396,10 +402,6 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         
         process_start = time.time()
 
-        # We need to pass enable_debug to cqdm used inside pipe if possible.
-        # But pipe uses `progress_bar_cmd` class or function.
-        # We can create a partial or wrapper class.
-
         class cqdm_debug(cqdm):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs, enable_debug=enable_debug)
@@ -427,17 +429,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         clean_vram()
 
     if is_single_frame_input and frames.shape[0] == 1:
-        # Special handling for single frame if needed, but tensor2video returns [F, H, W, C]
-        # logic below seems to handle temporal median if 1 frame? No, wait.
-        # If frames.shape[0] == 1, `final_output` is [F_out, H, W, C]. F_out corresponds to padded/processed.
-        # The original code did:
-        # stacked_image_tensor = torch.median(final_output, dim=0).values.unsqueeze(0).float().to('cpu')
-        # This seems to be a way to merge the 8n+1 frames back to 1?
-        # Because FlashVSR expands 1 frame to many to process it temporally?
-        # If input was 1 frame, padded to 21. Output 21. Median of 21 frames -> 1 frame.
         if frames.shape[0] == 1:
-            final_output = final_output.to(_device) # Move back for median calc if it was on CPU? Or keep on CPU?
-            # Median on CPU is fine and safer for VRAM
             final_output = final_output.to("cpu")
             stacked_image_tensor = torch.median(final_output, dim=0).values.unsqueeze(0).float()
             del final_output
@@ -491,7 +483,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                 is_single_frame_input=is_single_frame_input
             )
 
-            final_outputs.append(chunk_out.cpu()) # Ensure on CPU
+            final_outputs.append(chunk_out.cpu())
             del chunk_out
             clean_vram()
 
@@ -526,31 +518,31 @@ class FlashVSRNodeInitPipe:
             "required": {
                 "model": (["FlashVSR", "FlashVSR-v1.1"], {
                     "default": "FlashVSR-v1.1",
-                    "tooltip": "Model version."
+                    "tooltip": "Select the FlashVSR model version. V1.1 is recommended for better stability."
                 }),
                 "mode": (["tiny", "tiny-long", "full"], {
                     "default": "tiny",
-                    "tooltip": 'Using "tiny-long" mode can significantly reduce VRAM used with long video input.'
+                    "tooltip": 'Operation mode. "tiny": faster, standard memory. "tiny-long": optimized for long videos (lower VRAM). "full": higher quality but max VRAM.'
                 }),
                 "alt_vae": (["none"] + folder_paths.get_filename_list("vae"), {
                     "default": "none",
-                    "tooltip": 'Replaces the built-in VAE, only available in "full" mode.'
+                    "tooltip": 'Optional: Select an alternative VAE model to replace the built-in one. Only used in "full" mode.'
                 }),
                 "force_offload": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Offload all weights to CPU after running a workflow to free up VRAM."
+                    "tooltip": "If enabled, forces offloading of models to CPU RAM after execution to free up VRAM for other nodes."
                 }),
                 "precision": (["fp16", "bf16", "auto"], {
                     "default": "auto",
-                    "tooltip": "Data and inference precision. 'auto' selects bf16 if supported, else fp16."
+                    "tooltip": "Inference precision. 'auto' selects bf16 if supported (RTX 30/40/50 series), otherwise fp16. bf16 is recommended."
                 }),
                 "device": (device_choices, {
                     "default": device_choices[0],
-                    "tooltip": "Device to load the weights, default: auto (CUDA if available, else CPU)"
+                    "tooltip": "Select the computation device (CUDA GPU, CPU, etc.). 'auto' picks the best available."
                 }),
                 "attention_mode": (["sparse_sage_attention", "block_sparse_attention", "flash_attention_2", "sdpa"], {
                     "default": "sparse_sage_attention",
-                    "tooltip": 'Attention backend selection. "sparse_sage" and "block_sparse" use sparse masks. "flash_attention_2" and "sdpa" use dense attention (potentially slower but higher VRAM usage).'
+                    "tooltip": 'Attention mechanism backend. "sparse_sage"/"block_sparse" use efficient sparse attention. "flash_attention_2"/"sdpa" use dense attention (slower, more VRAM).'
                 }),
             }
         }
@@ -559,7 +551,7 @@ class FlashVSRNodeInitPipe:
     RETURN_NAMES = ("pipe",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Download the entire "FlashVSR" folder with all the files inside it from "https://huggingface.co/JunhaoZhuang/FlashVSR" and put it in the "ComfyUI/models"'
+    DESCRIPTION = 'Initializes the FlashVSR pipeline, loads models, and configures memory management settings.'
     
     def main(self, model, mode, alt_vae, force_offload, precision, device, attention_mode):
         _device = device
@@ -570,8 +562,6 @@ class FlashVSRNodeInitPipe:
             
         if _device.startswith("cuda"):
             torch.cuda.set_device(_device)
-            # Enforce physical VRAM limit? 
-            # torch.cuda.set_per_process_memory_fraction(1.0)
             
         wan_video_dit.ATTENTION_MODE = attention_mode
         
@@ -603,43 +593,46 @@ class FlashVSRNodeAdv:
         return {
             "required": {
                 "pipe": ("PIPE", {
-                    "tooltip": "FlashVSR pipeline"
+                    "tooltip": "The initialized FlashVSR pipeline object from the Init node."
                 }),
                 "frames": ("IMAGE", {
-                    "tooltip": "Sequential video frames as IMAGE tensor batch"
+                    "tooltip": "Input video frames to be upscaled. Batch of images (N, H, W, C)."
                 }),
                 "scale": ("INT", {
                     "default": 2,
                     "min": 2,
                     "max": 4,
+                    "tooltip": "Upscaling factor. 2x or 4x. Higher scale requires more VRAM and compute."
                 }),
                 "color_fix": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Use wavelet transform to correct output video color."
+                    "tooltip": "Apply wavelet-based color correction to match the output colors with the input, preventing color shifts."
                 }),
                 "tiled_vae": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Disable tiling: faster decode but higher VRAM usage.\nSet to True for lower memory consumption at the cost of speed."
+                    "tooltip": "Enable spatial tiling for the VAE decoder. Reduces VRAM usage significantly but is slower. Recommended for high-res outputs."
                 }),
                 "tiled_dit": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Significantly reduces VRAM usage at the cost of speed."
+                    "tooltip": "Enable spatial tiling for the Diffusion Transformer (DiT). Crucial for saving VRAM on large inputs. Disabling it is faster but risky."
                 }),
                 "tile_size": ("INT", {
                     "default": 256,
                     "min": 32,
                     "max": 1024,
                     "step": 32,
+                    "tooltip": "Size of the tiles for DiT processing. Smaller = less VRAM, more tiles, slower."
                 }),
                 "tile_overlap": ("INT", {
                     "default": 24,
                     "min": 8,
                     "max": 512,
                     "step": 8,
+                    "tooltip": "Overlap pixels between tiles to blend seams. Higher overlap = smoother transitions but more computation."
                 }),
                 "unload_dit": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Unload DiT before decoding to reduce VRAM peak at the cost of speed."
+                    "tooltip": "Unload the DiT model from VRAM before VAE decoding starts. Use this if VAE decode runs out of memory."
                 }),
                 "sparse_ratio": ("FLOAT", {
                     "default": 2.0,
@@ -647,7 +640,7 @@ class FlashVSRNodeAdv:
                     "max": 2.0,
                     "step": 0.1,
                     "display": "slider",
-                    "tooltip": "Recommended: 1.5 or 2.0\n1.5 → faster; 2.0 → more stable"
+                    "tooltip": "Control for sparse attention. 1.5 is faster, 2.0 is more stable/quality. (For sparse backends only)"
                 }),
                 "kv_ratio": ("FLOAT", {
                     "default": 3.0,
@@ -655,34 +648,35 @@ class FlashVSRNodeAdv:
                     "max": 3.0,
                     "step": 0.1,
                     "display": "slider",
-                    "tooltip": "Recommended: 1.0 to 3.0\n1.0 → less vram; 3.0 → high quality"
+                    "tooltip": "Key/Value cache ratio. 1.0 uses less VRAM; 3.0 provides highest quality retention."
                 }),
                 "local_range": ("INT", {
                     "default": 11,
                     "min": 9,
                     "max": 11,
                     "step": 2,
-                    "tooltip": "Recommended: 9 or 11\nlocal_range=9 → sharper details; 11 → more stable results"
+                    "tooltip": "Local attention range window. 9 = sharper details; 11 = more stable/consistent results."
                 }),
                 "seed": ("INT", {
                     "default": 0,
                     "min": 0,
-                    "max": 1125899906842624
+                    "max": 1125899906842624,
+                    "tooltip": "Random seed for noise generation. Same seed + same settings = reproducible results."
                 }),
                 "frame_chunk_size": ("INT", {
                     "default": 0,
                     "min": 0,
                     "max": 10000,
                     "step": 1,
-                    "tooltip": "Split processing into chunks of N frames to save VRAM. 0 = Process all frames at once."
+                    "tooltip": "Process video in chunks of N frames to prevent VRAM OOM. 0 = Process all frames at once. Results are merged on CPU."
                 }),
                 "enable_debug": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Enable extensive logging for debugging."
+                    "tooltip": "Enable verbose logging to console. Shows VRAM usage, step times, tile info, and detailed progress."
                 }),
                 "keep_models_on_cpu": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Add models to RAM (CPU) after processing, instead of keeping them on VRAM."
+                    "tooltip": "Move models to CPU RAM instead of keeping them in VRAM when not in use. Prevents VRAM fragmentation/OOM."
                 }),
             }
         }
@@ -691,7 +685,6 @@ class FlashVSRNodeAdv:
     RETURN_NAMES = ("image",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    #DESCRIPTION = ""
     
     def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu):
         _pipe, _ = pipe
@@ -704,56 +697,58 @@ class FlashVSRNode:
         return {
             "required": {
                 "frames": ("IMAGE", {
-                    "tooltip": "Sequential video frames as IMAGE tensor batch"
+                    "tooltip": "Input video frames to be upscaled. Batch of images (N, H, W, C)."
                 }),
                 "model": (["FlashVSR", "FlashVSR-v1.1"], {
                     "default": "FlashVSR-v1.1",
-                    "tooltip": "Model version."
+                    "tooltip": "Select the FlashVSR model version. V1.1 is recommended for better stability."
                 }),
                 "mode": (["tiny", "tiny-long", "full"], {
                     "default": "tiny",
-                    "tooltip": 'Using "tiny-long" mode can significantly reduce VRAM used with long video input.'
+                    "tooltip": 'Operation mode. "tiny": faster, standard memory. "tiny-long": optimized for long videos (lower VRAM). "full": higher quality but max VRAM.'
                 }),
                 "scale": ("INT", {
                     "default": 2,
                     "min": 2,
                     "max": 4,
+                    "tooltip": "Upscaling factor. 2x or 4x."
                 }),
                 "tiled_vae": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Disable tiling: faster decode but higher VRAM usage.\nSet to True for lower memory consumption at the cost of speed."
+                    "tooltip": "Enable spatial tiling for the VAE decoder. Reduces VRAM usage significantly but is slower. Recommended for high-res outputs."
                 }),
                 "tiled_dit": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Significantly reduces VRAM usage at the cost of speed."
+                    "tooltip": "Enable spatial tiling for the Diffusion Transformer (DiT). Crucial for saving VRAM on large inputs."
                 }),
                 "unload_dit": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Unload DiT before decoding to reduce VRAM peak at the cost of speed."
+                    "tooltip": "Unload the DiT model from VRAM before VAE decoding starts to free up memory."
                 }),
                 "seed": ("INT", {
                     "default": 0,
                     "min": 0,
-                    "max": 1125899906842624
+                    "max": 1125899906842624,
+                    "tooltip": "Random seed for noise generation."
                 }),
                 "frame_chunk_size": ("INT", {
                     "default": 0,
                     "min": 0,
                     "max": 10000,
                     "step": 1,
-                    "tooltip": "Split processing into chunks of N frames to save VRAM. 0 = Process all frames at once."
+                    "tooltip": "Process video in chunks of N frames to prevent VRAM OOM. 0 = Process all frames at once."
                 }),
                 "attention_mode": (["sparse_sage_attention", "block_sparse_attention", "flash_attention_2", "sdpa"], {
                     "default": "sparse_sage_attention",
-                    "tooltip": 'Attention backend selection. "sparse_sage" and "block_sparse" use sparse masks. "flash_attention_2" and "sdpa" use dense attention (potentially slower but higher VRAM usage).'
+                    "tooltip": 'Attention mechanism backend. "sparse_sage" is recommended for speed/memory efficiency.'
                 }),
                 "enable_debug": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Enable extensive logging for debugging."
+                    "tooltip": "Enable verbose logging to console. Shows VRAM usage, step times, tile info, and detailed progress."
                 }),
                 "keep_models_on_cpu": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Add models to RAM (CPU) after processing, instead of keeping them on VRAM."
+                    "tooltip": "Move models to CPU RAM instead of keeping them in VRAM when not in use."
                 }),
             }
         }
@@ -762,7 +757,7 @@ class FlashVSRNode:
     RETURN_NAMES = ("image",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Download the entire "FlashVSR" folder with all the files inside it from "https://huggingface.co/JunhaoZhuang/FlashVSR" and put it in the "ComfyUI/models"'
+    DESCRIPTION = 'Single-node easy usage for FlashVSR upscaling. Configure chunk size and tiling for best VRAM performance.'
     
     def main(self, model, frames, mode, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu):
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"

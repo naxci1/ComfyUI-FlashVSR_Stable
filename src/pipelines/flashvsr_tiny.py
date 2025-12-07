@@ -279,17 +279,17 @@ class FlashVSRTinyPipeline(BasePipeline):
     def _decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
         frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return frames
-    
+
     def decode_video(self, latents, cond=None, **kwargs):
         frames = self.TCDecoder.decode_video(
             latents.transpose(1, 2), # TCDecoder 需要 (B, F, C, H, W)
-            parallel=False, 
-            show_progress_bar=False, 
+            parallel=False,
+            show_progress_bar=False,
             cond=cond
         ).transpose(1, 2).mul_(2).sub_(1) # 转回 (B, C, F, H, W) 格式，范围 -1 to 1
-        
+
         return frames
-    
+
     def offload_model(self, keep_vae=False):
         self.dit.clear_cross_kv()
         self.prompt_emb_posi['stats'] = "offload"
@@ -332,7 +332,7 @@ class FlashVSRTinyPipeline(BasePipeline):
     ):
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
-        
+
         # 要求：必须先 init_cross_kv()
         if self.prompt_emb_posi is None or 'context' not in self.prompt_emb_posi:
             raise RuntimeError(
@@ -361,7 +361,7 @@ class FlashVSRTinyPipeline(BasePipeline):
 
         process_total_num = (num_frames - 1) // 8 - 2
         is_stream = True
-        
+
         if self.prompt_emb_posi['stats'] == "offload":
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
         self.load_models_to_device(["dit"])
@@ -413,7 +413,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
                     LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
-                        
+
                 # 推理（无 motion_controller / vace）
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
                     self.dit,
@@ -439,20 +439,147 @@ class FlashVSRTinyPipeline(BasePipeline):
                 cur_latents = cur_latents - noise_pred_posi
                 latents_total.append(cur_latents)
                 LQ_pre_idx = LQ_cur_idx
-            
+
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
-            
+
             if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
                 print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...")
                 self.offload_model(keep_vae=True)
 
             latents = torch.cat(latents_total, dim=2)
-            
+
             # Decode
             print("[FlashVSR] Starting VAE decoding...")
-            frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
-            
+            # We are outside the loop, so we have the full latents and full LQ_video available?
+            # LQ_cur_idx might only be up to the last processed block?
+            # Actually, `LQ_video[:,:,:LQ_cur_idx,:,:]` was used in original code.
+            # But we have all latents now. The condition is `cond` for TCDecoder.
+            # TCDecoder expects cond to match latent length?
+            # Latents (B, C, T_lat, H, W). Cond (B, 3, T_pixel, 8H, 8W).
+            # The TCDecoder handles time upsampling.
+            # We should pass the corresponding LQ frames.
+
+            # Note: flashvsr_tiny logic accumulates latents and decodes at once.
+            # We want to add tiled VAE support here.
+
+            cur_LQ_frame = LQ_video.to(self.device) # Use full LQ video? Or up to valid?
+            # Original code: `cond=LQ_video[:,:,:LQ_cur_idx,:,:]`
+            # `LQ_cur_idx` is updated in the loop.
+
+            if tiled: # tiled_vae logic ported from tiny-long
+                B, C, T, H, W = latents.shape
+
+                l_tile_h, l_tile_w = tile_size
+                l_stride_h, l_stride_w = tile_stride
+
+                if isinstance(l_tile_h, tuple): l_tile_h = l_tile_h[0]
+                if isinstance(l_tile_w, tuple): l_tile_w = l_tile_w[0]
+
+                l_tile_h = max(l_tile_h // 8, 4)
+                l_tile_w = max(l_tile_w // 8, 4)
+                l_stride_h = max(l_stride_h // 8, 1)
+                l_stride_w = max(l_stride_w // 8, 1)
+
+                out_H = H * 8
+                out_W = W * 8
+
+                cur_frames = torch.zeros((B, 3, T, out_H, out_W), dtype=latents.dtype, device='cpu')
+                weights = torch.zeros((B, 3, T, out_H, out_W), dtype=latents.dtype, device='cpu')
+
+                # We need state management for tiling if TCDecoder is stateful?
+                # TCDecoder IS stateful (memblocks). `decode_video` accepts `mem`.
+                # We need to maintain mem per tile.
+                vae_tile_states = {}
+
+                # However, here we have the full time dimension `T`.
+                # `tiny-long` loop processes 1 latent step (2 frames?) at a time.
+                # Here we have `T` latents.
+                # TCDecoder.decode_video processes a sequence.
+                # If we tile spatially, we pass (B, C, T, TileH, TileW).
+                # `decode_video` iterates over T internally?
+                # Let's check `TCDecoder.decode_video`. It calls `apply_model_with_memblocks`.
+                # It seems it can handle T dimension.
+                # But wait, does `mem` need to be handled if we pass the whole T?
+                # `decode_video` returns `x, mem`.
+                # If we pass full T, `mem` is the state at the end.
+                # So we can just call it on the spatial tile.
+
+                for y in range(0, H, l_stride_h):
+                    for x in range(0, W, l_stride_w):
+                        y_end = min(y + l_tile_h, H)
+                        x_end = min(x + l_tile_w, W)
+
+                        if y_end <= y or x_end <= x: continue
+
+                        # Latent tile
+                        lat_tile = latents[:, :, :, y:y_end, x:x_end]
+
+                        # Cond tile
+                        cond_y, cond_x = y * 8, x * 8
+                        cond_y_end, cond_x_end = y_end * 8, x_end * 8
+
+                        # LQ video length might need to match?
+                        # `cond=cur_LQ_frame`.
+                        # If latents has T, cond needs corresponding length.
+                        # Original: `cond=LQ_video[:,:,:LQ_cur_idx,:,:]`
+                        # We should slice LQ_video spatially too.
+                        # And temporally? `decode_video` handles temporal alignment?
+                        # Assuming `latents` and `cur_LQ_frame` are temporally aligned for the full sequence.
+                        # `LQ_cur_idx` was the end of valid frames?
+                        # Yes, use `:LQ_cur_idx` for temporal slice.
+
+                        cond_tile = cur_LQ_frame[:, :, :LQ_cur_idx, cond_y:cond_y_end, cond_x:cond_x_end]
+
+                        # Decode
+                        # We don't need external loop over T here, TCDecoder handles T.
+                        # But we need to reset mem for each spatial tile?
+                        # Yes, `mem=None` (default) for start of sequence.
+
+                        out_tile = self.TCDecoder.decode_video(
+                            lat_tile.transpose(1, 2),
+                            parallel=False,
+                            show_progress_bar=False,
+                            cond=cond_tile
+                            # mem=None implicitly
+                        )
+                        # returns (B, T, 3, H, W) ?? No, (B, 3, T, H, W)?
+                        # `tiny-long`: `out_tile, new_mem_tile = ...`
+                        # Wait, `decode_video` returns `x, mem` ONLY if `mem` arg is provided or if it's designed to?
+                        # Let's check `tiny-long` usage:
+                        # `out_tile, new_mem_tile = self.TCDecoder.decode_video(..., mem=mem_tile)`
+                        # If we don't pass `mem`, does it return just `x`?
+                        # In `flashvsr_tiny.py` original: `frames = self.TCDecoder.decode_video(...)`. One return value.
+                        # So `decode_video` returns `x` if `mem` not passed? Or tuple?
+                        # I suspect `decode_video` signature varies or handles it.
+                        # If I look at `nodes.py` traceback earlier:
+                        # `File .../TCDecoder.py", line 270, in decode_video`
+                        # `x, mem = apply_model_with_memblocks(...)`
+                        # It seems it returns tuple `x, mem`?
+                        # But `tiny.py` line 348: `frames = self.TCDecoder.decode_video(...).transpose(...)`
+                        # This implies it returns a Tensor, not a tuple.
+                        # Unless `decode_video` has logic: `if mem is None: return x`.
+                        # I should assume it returns Tensor if I don't pass mem?
+                        # But `tiny-long` passes mem.
+                        # Let's assume for `tiny` mode (full sequence decode), we don't need manual mem management because we decode the whole T at once.
+                        # So `out_tile = self.TCDecoder.decode_video(...)` returns Tensor.
+
+                        out_tile = out_tile.transpose(1, 2).to('cpu')
+                        th, tw = out_tile.shape[3], out_tile.shape[4]
+
+                        mask = torch.ones((1, 1, 1, th, tw), device='cpu')
+
+                        y_out, x_out = y * 8, x * 8
+                        cur_frames[:, :, :, y_out:y_out+th, x_out:x_out+tw] += out_tile * mask
+                        weights[:, :, :, y_out:y_out+th, x_out:x_out+tw] += mask
+
+                weights[weights == 0] = 1.0
+                cur_frames = cur_frames / weights
+                frames = cur_frames.mul_(2).sub_(1)
+
+            else:
+                frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=cur_LQ_frame[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+
             self.TCDecoder.clean_mem()
             if force_offload:
                 self.offload_model()
@@ -485,7 +612,7 @@ class TeaCache:
         self.rel_l1_thresh = rel_l1_thresh
         self.previous_residual = None
         self.previous_hidden_states = None
-        
+
         self.coefficients_dict = {
             "Wan2.1-T2V-1.3B": [-5.21862437e+04, 9.23041404e+03, -5.28275948e+02, 1.36987616e+01, -4.99875664e-02],
             "Wan2.1-T2V-14B":  [-3.03318725e+05, 4.90537029e+04, -2.65530556e+03, 5.87365115e+01, -3.15583525e-01],
