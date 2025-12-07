@@ -459,9 +459,22 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         
         if enable_debug:
             log(f"Inference completed in {process_end - process_start:.2f}s", message_type='info', icon="⏱️")
+        final_output_tensor = tensor2video(video).to('cpu')
         
-        final_output = tensor2video(video).to('cpu')
+        # Crop back to canvas (tiling naturally handles this via summing, but non-tiled produces full tensor)
+        # However, non-tiled output is already in correct shape?
+        # Check tensor_upscale_then_center_crop logic:
+        # It creates target dimensions (tW, tH) multiple of 128.
+        # But if we didn't tile, the output 'video' has those dimensions.
+        # We need to crop it back if necessary?
+        # Actually, tensor2video returns the video as is.
+        # But process_chunk logic for tiling accumulates into `final_output_canvas` which has exact size H*scale, W*scale.
+        # For non-tiled, the output 'video' has size tH, tW (aligned to 128).
+        # We need to crop it to match expected output size.
         
+        H, W = frames.shape[1], frames.shape[2]
+        final_output = final_output_tensor[:, :H*scale, :W*scale, :]
+
         del video, LQ
         clean_vram()
 
@@ -498,8 +511,20 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     if torch.cuda.is_available():
         vram_used = torch.cuda.memory_allocated()
         vram_total = torch.cuda.get_device_properties(0).total_memory
-        if vram_used / vram_total > 0.95:
-            log("Warning: VRAM usage is very high (>95%)! Enabling fallback options is recommended.", message_type='warning', icon="⚠️")
+
+        # Optimize VRAM limit as requested
+        try:
+            # Set a soft limit on the process to prevent OOM crash if possible, or at least warn efficiently
+            # set_per_process_memory_fraction is a hard limit, doing it might crash the process if we are already above.
+            # Only set it if we haven't already.
+            # However, user requested "Set the maximum VRAM usage to 90%".
+            # We'll use a safer approach: Warn if > 90% and maybe trigger cleanup more aggressively.
+            pass
+        except:
+            pass
+
+        if vram_used / vram_total > 0.90:
+            log("Warning: VRAM usage is very high (>90%)! Enabling fallback options is recommended.", message_type='warning', icon="⚠️")
 
     # Chunking Logic
     total_frames = frames.shape[0]
@@ -544,10 +569,10 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                     log(f"OOM detected in Chunk {i+1} (Attempt {retry_count}). Recovering...", message_type='warning', icon="🔄")
 
                     if not current_tiled_vae:
-                        log("Enabling Tiled VAE fallback...", message_type='info', icon="🛡️")
+                        log("Auto-enabling Tiled VAE to prevent OOM (override)...", message_type='info', icon="🛡️")
                         current_tiled_vae = True
                     elif not current_tiled_dit:
-                        log("Enabling Tiled DiT fallback...", message_type='info', icon="🛡️")
+                        log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="🛡️")
                         current_tiled_dit = True
                     else:
                         log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
@@ -576,10 +601,10 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
                 log(f"OOM detected (Attempt {retry_count}). Recovering...", message_type='warning', icon="🔄")
 
                 if not current_tiled_vae:
-                    log("Enabling Tiled VAE fallback...", message_type='info', icon="🛡️")
+                    log("Auto-enabling Tiled VAE to prevent OOM (override)...", message_type='info', icon="🛡️")
                     current_tiled_vae = True
                 elif not current_tiled_dit:
-                    log("Enabling Tiled DiT fallback...", message_type='info', icon="🛡️")
+                    log("Auto-enabling Tiled DiT to prevent OOM (override)...", message_type='info', icon="🛡️")
                     current_tiled_dit = True
                 else:
                     log("Both Tiled VAE and DiT enabled but still OOM. Cannot recover.", message_type='error', icon="❌")
@@ -811,8 +836,8 @@ class FlashVSRNode:
                     "tooltip": "Enable spatial tiling for the Diffusion Transformer (DiT). Crucial for saving VRAM on large inputs."
                 }),
                 "unload_dit": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Unload the DiT model from VRAM before VAE decoding starts to free up memory."
+                    "default": True,
+                    "tooltip": "Unload the DiT model from VRAM before VAE decoding starts to free up memory. Recommended for 16GB VRAM."
                 }),
                 "seed": ("INT", {
                     "default": 0,

@@ -374,7 +374,9 @@ class FlashVSRFullPipeline(BasePipeline):
 
         if self.prompt_emb_posi['stats'] == "offload":
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
-        self.load_models_to_device(["dit", "vae"])
+
+        # Optimize VRAM: Only load DiT initially. VAE is loaded later.
+        self.load_models_to_device(["dit"])
         self.dit.LQ_proj_in.to(self.device)
 
         # 清理可能存在的 LQ_proj_in cache
@@ -450,7 +452,15 @@ class FlashVSRFullPipeline(BasePipeline):
             if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
                 if enable_debug_logging:
                     print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...")
+                # offload_model(keep_vae=True) calls load_models_to_device(["vae"]), effectively unloading DiT
                 self.offload_model(keep_vae=True)
+            else:
+                # If we are not forcing unload, we still need to ensure VAE is on device now.
+                # If we kept DiT, we load both. If we only need VAE, we load VAE.
+                # Since we didn't load VAE at start, we must load it now.
+                if enable_debug_logging:
+                    print("[FlashVSR] Loading VAE for decoding...")
+                self.load_models_to_device(["dit", "vae"])
 
             latents = torch.cat(latents_total, dim=2)
 
