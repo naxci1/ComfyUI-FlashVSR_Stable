@@ -10,3 +10,4 @@ triton; platform_system!="Windows"
 triton-windows; platform_system=="Windows"
 sageattention
 flash-attn --no-build-isolation; platform_system!="Windows"
+psutil
