@@ -6,16 +6,24 @@ import math
 import torch
 import folder_paths
 import comfy.utils
+import time
+import sys
 
 import numpy as np
 import torch.nn.functional as F
 
 from einops import rearrange
 from huggingface_hub import snapshot_download
-from .src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
-from .src.models.TCDecoder import build_tcdecoder
-from .src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
-from .src.models import wan_video_dit
+try:
+    from .src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
+    from .src.models.TCDecoder import build_tcdecoder
+    from .src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
+    from .src.models import wan_video_dit
+except ImportError:
+    from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
+    from src.models.TCDecoder import build_tcdecoder
+    from src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
+    from src.models import wan_video_dit
 
 device_choices = get_device_list()
 
@@ -30,17 +38,20 @@ def log(message:str, message_type:str='normal'):
         message = '\033[1;33m' + message + '\033[m'
     else:
         message = message
-    print(f"{message}")
+    print(f"{message}", flush=True)
 
-def model_downlod(model_name="JunhaoZhuang/FlashVSR"):
+def model_download(model_name="JunhaoZhuang/FlashVSR"):
     model_dir = os.path.join(folder_paths.models_dir, model_name.split("/")[-1])
     if not os.path.exists(model_dir):
         log(f"Downloading model '{model_name}' from huggingface...", message_type='info')
         snapshot_download(repo_id=model_name, local_dir=model_dir, local_dir_use_symlinks=False, resume_download=True)
 
 def tensor2video(frames: torch.Tensor):
+    # Replaced einops with native PyTorch
+    # video_permuted = rearrange(video_squeezed, "C F H W -> F H W C")
+    # frames: (1, C, F, H, W) -> squeeze(0) -> (C, F, H, W)
     video_squeezed = frames.squeeze(0)
-    video_permuted = rearrange(video_squeezed, "C F H W -> F H W C")
+    video_permuted = video_squeezed.permute(1, 2, 3, 0) # C F H W -> F H W C
     video_final = (video_permuted.float() + 1.0) / 2.0
     return video_final
 
@@ -55,8 +66,12 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: i
         raise ValueError("invalid original size")
 
     sW, sH = w0 * scale, h0 * scale
-    tW = max(multiple, (sW // multiple) * multiple)
-    tH = max(multiple, (sH // multiple) * multiple)
+
+    # Calculate target dimensions by rounding up to the nearest multiple
+    # This ensures we always pad instead of crop, preserving all content
+    tW = math.ceil(sW / multiple) * multiple
+    tH = math.ceil(sH / multiple) * multiple
+
     return sW, sH, tW, tH
 
 def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int) -> torch.Tensor:
@@ -66,8 +81,20 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
     sW, sH = w0 * scale, h0 * scale
     upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
     
-    l = max(0, (sW - tW) // 2)
-    t = max(0, (sH - tH) // 2)
+    # Lossless padding: if scaled size is different from target, we pad/crop.
+    # Since we changed tW/tH to be round UP, sW <= tW and sH <= tH.
+    # So we should only need padding.
+
+    if sW < tW or sH < tH:
+        pad_l = max(0, (tW - sW) // 2)
+        pad_r = max(0, tW - sW - pad_l)
+        pad_t = max(0, (tH - sH) // 2)
+        pad_b = max(0, tH - sH - pad_t)
+        upscaled_tensor = F.pad(upscaled_tensor, (pad_l, pad_r, pad_t, pad_b), mode='constant', value=0)
+
+    # Just in case tW/tH calculation was different (e.g. smaller), we keep cropping logic for safety
+    l = max(0, (upscaled_tensor.shape[3] - tW) // 2)
+    t = max(0, (upscaled_tensor.shape[2] - tH) // 2)
     cropped_tensor = upscaled_tensor[:, :, t:t + tH, l:l + tW]
 
     return cropped_tensor.squeeze(0)
@@ -75,7 +102,7 @@ def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: 
 def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
     N0, h0, w0, _ = image_tensor.shape
     
-    multiple = 128
+    multiple = 128 # Keep 128 alignment for VAE/DiT blocks
     sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
     num_frames_with_padding = N0 + 4
     F = largest_8n1_leq(num_frames_with_padding)
@@ -137,7 +164,7 @@ def create_feather_mask(size, overlap):
     return mask
 
 def init_pipeline(model, mode, device, dtype, alt_vae="none"):
-    model_downlod(model_name="JunhaoZhuang/"+model)
+    model_download(model_name="JunhaoZhuang/"+model)
     model_path = os.path.join(folder_paths.models_dir, model)
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist!\nPlease save all weights to "{model_path}"')
@@ -242,10 +269,25 @@ class cqdm:
     def __len__(self):
         return self.total
 
-def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload):
+def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False):
+    clean_vram()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.ipc_collect() # Improved Memory Management
+
+    start_time = time.time()
+
     _frames = frames
     _device = pipe.device
     dtype = pipe.torch_dtype
+
+    if enable_debug:
+        log(f"[FlashVSR] Debug Mode: Enabled", message_type='info')
+        log(f"[FlashVSR] Device: {_device}", message_type='info')
+        if torch.cuda.is_available():
+             log(f"[FlashVSR] Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB", message_type='info')
+        log(f"[FlashVSR] Input Frames: {frames.shape}", message_type='info')
+        log(f"[FlashVSR] Tiled DiT: {tiled_dit}, Tiled VAE: {tiled_vae}", message_type='info')
 
     add = next_8n5(frames.shape[0]) - frames.shape[0]
     padding_frames = frames[-1:, :, :, :].repeat(add, 1, 1, 1)
@@ -254,6 +296,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
     if tiled_dit:
         N, H, W, C = _frames.shape
         
+        # Use RAM more efficiently by pre-allocating
         final_output_canvas = torch.zeros(
             (N, H * scale, W * scale, C), 
             dtype=torch.float16, 
@@ -261,9 +304,12 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         )
         weight_sum_canvas = torch.zeros_like(final_output_canvas)
         tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
-        latent_tiles_cpu = []
         
         for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc="Processing Tiles")):
+            if enable_debug:
+                tile_start = time.time()
+                vram_start = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+
             log(f"[FlashVSR] Processing tile {i+1}/{len(tile_coords)}: coords ({x1},{y1}) to ({x2},{y2})", message_type='info')
             input_tile = _frames[:, y1:y2, x1:x2, :]
             
@@ -280,6 +326,11 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
             
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
             
+            if enable_debug:
+                tile_end = time.time()
+                vram_end = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+                log(f"   Tile {i+1} done in {tile_end - tile_start:.2f}s. VRAM: {vram_start:.2f}GB -> {vram_end:.2f}GB", message_type='info')
+
             mask_nchw = create_feather_mask(
                 (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
                 tile_overlap * scale
@@ -317,7 +368,15 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         del video, LQ
         clean_vram()
         
-    log("[FlashVSR] Done.", message_type='info')
+    end_time = time.time()
+    total_time = end_time - start_time
+    fps = frames.shape[0] / total_time if total_time > 0 else 0
+    log(f"[FlashVSR] Done in {total_time:.2f}s ({fps:.2f} FPS).", message_type='finish')
+
+    if torch.cuda.is_available():
+        peak_memory = torch.cuda.max_memory_reserved() / 1024**3
+        log(f"[FlashVSR] Peak VRAM used: {peak_memory:.2f} GB", message_type='info')
+
     if frames.shape[0] == 1:
         final_output = final_output.to(_device)
         stacked_image_tensor = torch.median(final_output, dim=0).values.unsqueeze(0).float().to('cpu')
@@ -348,9 +407,9 @@ class FlashVSRNodeInitPipe:
                     "default": True,
                     "tooltip": "Offload all weights to CPU after running a workflow to free up VRAM."
                 }),
-                "precision": (["fp16", "bf16"], {
-                    "default": "bf16",
-                    "tooltip": "Data and inference precision."
+                "precision": (["fp16", "bf16", "auto"], {
+                    "default": "auto",
+                    "tooltip": "Data and inference precision. 'auto' selects bf16 if supported, else fp16."
                 }),
                 "device": (device_choices, {
                     "default": device_choices[0],
@@ -378,11 +437,22 @@ class FlashVSRNodeInitPipe:
             
         if _device.startswith("cuda"):
             torch.cuda.set_device(_device)
+            # Enforce physical VRAM limit?
+            # torch.cuda.set_per_process_memory_fraction(1.0)
             
         if attention_mode == "sparse_sage_attention":
             wan_video_dit.USE_BLOCK_ATTN = False
         else:
             wan_video_dit.USE_BLOCK_ATTN = True
+
+        # Auto bfloat16 detection
+        if precision == "auto":
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                precision = "bf16"
+                log("[FlashVSR] Auto-detected bf16 support.", message_type='info')
+            else:
+                precision = "fp16"
+                log("[FlashVSR] Defaulting to fp16.", message_type='info')
             
         dtype_map = {
             "fp32": torch.float32,
@@ -469,6 +539,14 @@ class FlashVSRNodeAdv:
                     "min": 0,
                     "max": 1125899906842624
                 }),
+                "enable_debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable extensive logging for debugging."
+                }),
+                "keep_models_on_cpu": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Add models to RAM (CPU) after processing, instead of keeping them on VRAM."
+                }),
             }
         }
     
@@ -478,9 +556,9 @@ class FlashVSRNodeAdv:
     CATEGORY = "FlashVSR"
     #DESCRIPTION = ""
     
-    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed):
-        _pipe, force_offload = pipe
-        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload)
+    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, enable_debug, keep_models_on_cpu):
+        _pipe, _ = pipe
+        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, keep_models_on_cpu, enable_debug)
         return(output,)
 
 class FlashVSRNode:

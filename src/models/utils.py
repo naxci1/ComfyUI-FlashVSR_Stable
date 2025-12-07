@@ -1,7 +1,7 @@
 import torch, os, gc
 from safetensors import safe_open
 from contextlib import contextmanager
-from einops import rearrange, repeat
+# from einops import rearrange, repeat # Replacing with native ops where possible
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -238,15 +238,15 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
         
     def forward(self, x, cache_x=None):
+        # Workaround for Conv3d memory issues in some PyTorch/cuDNN versions
+        # Only apply padding manually
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
-            # print(cache_x.shape, x.shape)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
-            # print('cache!')
-        x = F.pad(x, padding, mode='replicate') # mode='replicate'
-        # print(x[0,0,:,0,0])
+
+        x = F.pad(x, padding, mode='replicate')
         
         return super().forward(x)
     
@@ -259,9 +259,18 @@ class PixelShuffle3d(nn.Module):
         
     def forward(self, x):
         # x: (B, C, F, H, W)
-        return rearrange(x, 
-                         'b c (f ff) (h hh) (w ww) -> b (c ff hh ww) f h w',
-                         ff=self.ff, hh=self.hh, ww=self.ww)
+        # rearrange(x, 'b c (f ff) (h hh) (w ww) -> b (c ff hh ww) f h w', ff=self.ff, hh=self.hh, ww=self.ww)
+
+        b, c, f_ff, h_hh, w_ww = x.shape
+        f = f_ff // self.ff
+        h = h_hh // self.hh
+        w = w_ww // self.ww
+
+        # Native PyTorch implementation of rearrange
+        x = x.view(b, c, f, self.ff, h, self.hh, w, self.ww)
+        x = x.permute(0, 1, 3, 5, 7, 2, 4, 6) # b c ff hh ww f h w
+        x = x.reshape(b, c * self.ff * self.hh * self.ww, f, h, w)
+        return x
     
 class Buffer_LQ4x_Proj(nn.Module):
     
@@ -296,7 +305,6 @@ class Buffer_LQ4x_Proj(nn.Module):
         iter_ = 1 + (t - 1) // 4
         first_frame = video[:, :, :1, :, :].repeat(1, 1, 3, 1, 1)
         video = torch.cat([first_frame, video], dim=2)
-        # print(video.shape)
         
         out_x = []
         for i in range(iter_):
@@ -315,8 +323,11 @@ class Buffer_LQ4x_Proj(nn.Module):
             x = self.act2(x)
             out_x.append(x)
         out_x = torch.cat(out_x, dim = 2)
-        # print(out_x.shape)
-        out_x = rearrange(out_x, 'b c f h w -> b (f h w) c')
+
+        # rearrange(out_x, 'b c f h w -> b (f h w) c')
+        b, c, f, h, w = out_x.shape
+        out_x = out_x.permute(0, 2, 3, 4, 1).reshape(b, f * h * w, c)
+
         outputs = []
         for i in range(self.layer_num):
             outputs.append(self.linear_layers[i](out_x))
@@ -346,16 +357,19 @@ class Buffer_LQ4x_Proj(nn.Module):
         else:
             x = self.pixel_shuffle(video_clip)
             cache1_x = x[:, :, -CACHE_T:, :, :].clone()
-            self.cache['conv1'] = cache1_x
             x = self.conv1(x, self.cache['conv1'])
+            self.cache['conv1'] = cache1_x
             x = self.norm1(x)
             x = self.act1(x)
             cache2_x = x[:, :, -CACHE_T:, :, :].clone()
-            self.cache['conv2'] = cache2_x
             x = self.conv2(x, self.cache['conv2'])
             x = self.norm2(x)
             x = self.act2(x)
-            out_x = rearrange(x, 'b c f h w -> b (f h w) c')
+
+            # rearrange(x, 'b c f h w -> b (f h w) c')
+            b, c, f, h, w = x.shape
+            out_x = x.permute(0, 2, 3, 4, 1).reshape(b, f * h * w, c)
+
             outputs = []
             for i in range(self.layer_num):
                 outputs.append(self.linear_layers[i](out_x))
@@ -415,7 +429,11 @@ class Causal_LQ4x_Proj(nn.Module):
             x = self.act2(x)
             out_x.append(x)
         out_x = torch.cat(out_x, dim = 2)
-        out_x = rearrange(out_x, 'b c f h w -> b (f h w) c')
+
+        # rearrange(out_x, 'b c f h w -> b (f h w) c')
+        b, c, f, h, w = out_x.shape
+        out_x = out_x.permute(0, 2, 3, 4, 1).reshape(b, f * h * w, c)
+
         outputs = []
         for i in range(self.layer_num):
             outputs.append(self.linear_layers[i](out_x))
@@ -454,7 +472,11 @@ class Causal_LQ4x_Proj(nn.Module):
             self.cache['conv2'] = cache2_x
             x = self.norm2(x)
             x = self.act2(x)
-            out_x = rearrange(x, 'b c f h w -> b (f h w) c')
+
+            # rearrange(x, 'b c f h w -> b (f h w) c')
+            b, c, f, h, w = x.shape
+            out_x = x.permute(0, 2, 3, 4, 1).reshape(b, f * h * w, c)
+
             outputs = []
             for i in range(self.layer_num):
                 outputs.append(self.linear_layers[i](out_x))
