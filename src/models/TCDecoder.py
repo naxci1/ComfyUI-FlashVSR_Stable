@@ -251,20 +251,38 @@ class TAEHV(nn.Module):
                     sd[key] = sd[key][-new_sd[key].shape[0]:]
         return sd
 
-    def decode_video(self, x, parallel=True, show_progress_bar=False, cond=None):
+    def decode_video(self, x, parallel=True, show_progress_bar=False, cond=None, mem=None):
         """Decode a sequence of frames from latents.
         x: NTCHW latent tensor; returns NTCHW RGB in ~[0, 1].
         """
-        trim_flag = self.mem[-8] is None  # keeps original relative check
+
+        # Determine if we are using external memory (tiling) or internal state
+        using_external_mem = mem is not None
+
+        if not using_external_mem:
+            mem = self.mem
+
+        trim_flag = mem[-8] is None  # keeps original relative check
 
         if cond is not None:
             x = torch.cat([self.pixel_shuffle(cond), x], dim=2)
 
-        x, self.mem = apply_model_with_memblocks(self.decoder, x, parallel, show_progress_bar, mem=self.mem)
+        x, mem = apply_model_with_memblocks(self.decoder, x, parallel, show_progress_bar, mem=mem)
+
+        # If we used internal memory, update it
+        if not using_external_mem:
+            self.mem = mem
 
         if trim_flag:
-            return x[:, self.frames_to_trim:]
-        return x
+            res = x[:, self.frames_to_trim:]
+        else:
+            res = x
+
+        # If external memory was passed, return it so the caller can maintain state
+        if using_external_mem:
+            return res, mem
+        else:
+            return res
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError("Decoder-only model: call decode_video(...) instead.")
