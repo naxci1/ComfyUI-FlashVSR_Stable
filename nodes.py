@@ -488,11 +488,23 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
 
     return final_output[:frames.shape[0], :, :, :]
 
-def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0):
+def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0):
     clean_vram()
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.ipc_collect()
+
+    # Resize Input Frames if requested
+    if resize_factor < 1.0 and resize_factor > 0:
+        log(f"Resizing input by factor {resize_factor}...", message_type='info', icon="📉")
+        N, H, W, C = frames.shape
+        new_H, new_W = int(H * resize_factor), int(W * resize_factor)
+        # Permute to NCHW for interpolate
+        frames_permuted = frames.permute(0, 3, 1, 2)
+        frames_resized = F.interpolate(frames_permuted, size=(new_H, new_W), mode='bicubic', align_corners=False)
+        frames = frames_resized.permute(0, 2, 3, 1) # Back to NHWC
+        del frames_permuted, frames_resized
+        clean_vram()
 
     start_time = time.time()
 
@@ -792,6 +804,13 @@ class FlashVSRNodeAdv:
                     "default": True,
                     "tooltip": "Move models to CPU RAM instead of keeping them in VRAM when not in use. Prevents VRAM fragmentation/OOM."
                 }),
+                "resize_factor": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.1,
+                    "max": 1.0,
+                    "step": 0.1,
+                    "tooltip": "Resize input frames before processing. Set to 0.5x for large 1080p+ videos to save VRAM."
+                }),
             }
         }
     
@@ -800,9 +819,9 @@ class FlashVSRNodeAdv:
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
     
-    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu):
+    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu, resize_factor):
         _pipe, _ = pipe
-        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, keep_models_on_cpu, enable_debug, frame_chunk_size)
+        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor)
         return(output,)
 
 class FlashVSRNode:
@@ -864,6 +883,13 @@ class FlashVSRNode:
                     "default": True,
                     "tooltip": "Move models to CPU RAM instead of keeping them in VRAM when not in use."
                 }),
+                "resize_factor": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.1,
+                    "max": 1.0,
+                    "step": 0.1,
+                    "tooltip": "Resize input frames before processing. Set to 0.5x for large 1080p+ videos to save VRAM."
+                }),
             }
         }
     
@@ -873,7 +899,7 @@ class FlashVSRNode:
     CATEGORY = "FlashVSR"
     DESCRIPTION = 'Single-node easy usage for FlashVSR upscaling. Configure chunk size and tiling for best VRAM performance.'
     
-    def main(self, model, frames, mode, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu):
+    def main(self, model, frames, mode, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu, resize_factor):
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"
         if _device == "auto" or _device not in device_choices:
             raise RuntimeError("No devices found to run FlashVSR!")
@@ -884,7 +910,7 @@ class FlashVSRNode:
         wan_video_dit.ATTENTION_MODE = attention_mode
             
         pipe = init_pipeline(model, mode, _device, torch.float16)
-        output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size)
+        output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor)
         return(output,)
 
 NODE_CLASS_MAPPINGS = {

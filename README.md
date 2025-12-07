@@ -45,7 +45,10 @@ Running FlashVSR on lower VRAM without any artifacts.
 - Initial release of this project.
 
 ## Preview
-![](./img/preview.jpg)
+![](./workflow/image.png)
+
+## Sample Workflow
+[Download Workflow JSON](./workflow/FlashVSR.json)
 
 ## Performance & VRAM Optimization
 
@@ -64,6 +67,7 @@ This node is optimized for various hardware configurations. Here are some guidel
 - **Attention Mode**: Use `sparse_sage_attention` for the best balance of speed and memory. `flash_attention_2` is faster but requires specific hardware/installation.
 - **Precision**: `bf16` (BFloat16) is recommended for RTX 3000/4000/5000 series. It is faster and preserves dynamic range better than `fp16`.
 - **Chunking**: Use `frame_chunk_size` to process videos in segments. This moves processed frames to CPU RAM, preventing VRAM saturation on long clips.
+- **Resize Input**: If the input video is large (e.g., 1080p), use the `resize_factor` parameter to reduce input size to `0.5x` before processing. This drastically reduces VRAM usage and allows for 4x upscaling of the resized result (net 2x output). For small videos, leave at `1.0`.
 
 ## Node Features
 
