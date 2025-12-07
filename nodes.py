@@ -28,6 +28,11 @@ except ImportError:
     from src.models import wan_video_dit
     from src.models.wan_video_vae import WanVideoVAE
 
+try:
+    import safetensors.torch
+except ImportError:
+    pass
+
 device_choices = get_device_list()
 
 def log(message: str, message_type: str = 'normal', icon: str = ""):
@@ -208,8 +213,18 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none"):
             log("ModelManager failed to load VAE. Attempting manual load...", message_type='warning', icon="⚠️")
             try:
                 pipe.vae = WanVideoVAE(z_dim=16, dim=96).to(device=device, dtype=dtype)
-                # Load state dict
-                sd = torch.load(vae_path, map_location="cpu")
+
+                # Check for safetensors vs pth
+                if vae_path.endswith(".safetensors"):
+                    try:
+                        import safetensors.torch
+                        sd = safetensors.torch.load_file(vae_path)
+                    except ImportError:
+                        raise RuntimeError("safetensors library required to load .safetensors VAE file. Please install it.")
+                else:
+                    # Allow weights_only=False for .pth files as per user request/necessity with older formats
+                    sd = torch.load(vae_path, map_location="cpu", weights_only=False)
+
                 pipe.vae.load_state_dict(sd)
                 log(f"Manually loaded VAE from {vae_path}", message_type='info', icon="📦")
             except Exception as e:
@@ -226,14 +241,14 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none"):
             pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device=device)
         multi_scale_channels = [512, 256, 128, 128]
         pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
-        mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
+        mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device, weights_only=False), strict=False)
         pipe.TCDecoder.clean_mem()
     
     if model == "FlashVSR":
         pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
     else:
         pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
-    pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu"), strict=True)
+    pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu", weights_only=False), strict=True)
     pipe.denoising_model().LQ_proj_in.to(device)
     pipe.to(device, dtype=dtype)
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
