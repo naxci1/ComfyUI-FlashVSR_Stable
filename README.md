@@ -12,6 +12,7 @@ Running FlashVSR on lower VRAM without any artifacts.
 - **Optimization**: Added "Conv3d memory workaround" for improved compatibility with newer PyTorch versions.
 - **Optimization**: Added `torch.cuda.ipc_collect()` for better memory cleanup.
 - **New Feature**: Added `attention_mode` selection with support for `flash_attention_2`, `sdpa`, `sparse_sage`, and `block_sparse` backends.
+- **New Feature**: Implemented VAE spatial tiling to reduce VRAM usage during decoding (experimental).
 - **Refactor**: Cleaned up code and improved error handling for imports.
 
 #### 2025-10-24
