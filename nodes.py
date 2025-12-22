@@ -20,13 +20,19 @@ try:
     from .src.models.TCDecoder import build_tcdecoder
     from .src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
     from .src.models import wan_video_dit
-    from .src.models.wan_video_vae import WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae
+    from .src.models.wan_video_vae import (
+        WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae,
+        VAE_FULL_DIM, VAE_LIGHT_DIM, VAE_Z_DIM
+    )
 except ImportError:
     from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
     from src.models.TCDecoder import build_tcdecoder
     from src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
     from src.models import wan_video_dit
-    from src.models.wan_video_vae import WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae
+    from src.models.wan_video_vae import (
+        WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae,
+        VAE_FULL_DIM, VAE_LIGHT_DIM, VAE_Z_DIM
+    )
 
 try:
     import safetensors.torch
@@ -238,16 +244,16 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none", vae_type="wan2.1")
         if pipe.vae is None:
             log("ModelManager failed to load VAE. Attempting manual load...", message_type='warning', icon="⚠️")
             try:
-                # Create VAE based on selected type
+                # Create VAE based on selected type using constants
                 vae_type_lower = vae_type.lower()
                 if vae_type_lower == "wan2.2":
-                    pipe.vae = Wan22VideoVAE(z_dim=16, dim=96).to(device=device, dtype=dtype)
+                    pipe.vae = Wan22VideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM).to(device=device, dtype=dtype)
                     log(f"Using Wan2.2 VAE (optimized normalization)", message_type='info', icon="🚀")
                 elif vae_type_lower == "lightx2v":
-                    pipe.vae = LightX2VVAE(z_dim=16, dim=64, use_full_arch=True).to(device=device, dtype=dtype)
+                    pipe.vae = LightX2VVAE(z_dim=VAE_Z_DIM, dim=VAE_LIGHT_DIM, use_full_arch=True).to(device=device, dtype=dtype)
                     log(f"Using LightX2V VAE (optimized for VRAM)", message_type='info', icon="⚡")
                 else:
-                    pipe.vae = WanVideoVAE(z_dim=16, dim=96).to(device=device, dtype=dtype)
+                    pipe.vae = WanVideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM).to(device=device, dtype=dtype)
                     log(f"Using Wan2.1 VAE (default)", message_type='info', icon="📦")
 
                 # Check for safetensors vs pth
@@ -272,12 +278,12 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none", vae_type="wan2.1")
             if vae_type_lower == "wan2.2" and not isinstance(pipe.vae, Wan22VideoVAE):
                 log(f"Upgrading to Wan2.2 VAE with optimized normalization...", message_type='info', icon="🚀")
                 old_state = pipe.vae.state_dict()
-                pipe.vae = Wan22VideoVAE(z_dim=16, dim=96).to(device=device, dtype=dtype)
+                pipe.vae = Wan22VideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM).to(device=device, dtype=dtype)
                 pipe.vae.load_state_dict(old_state)
             elif vae_type_lower == "lightx2v" and not isinstance(pipe.vae, LightX2VVAE):
                 log(f"Switching to LightX2V VAE for reduced VRAM...", message_type='info', icon="⚡")
                 old_state = pipe.vae.state_dict()
-                pipe.vae = LightX2VVAE(z_dim=16, dim=64, use_full_arch=True).to(device=device, dtype=dtype)
+                pipe.vae = LightX2VVAE(z_dim=VAE_Z_DIM, dim=VAE_LIGHT_DIM, use_full_arch=True).to(device=device, dtype=dtype)
                 pipe.vae.load_state_dict(old_state)
 
         pipe.vae.model.encoder = None
