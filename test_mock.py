@@ -21,8 +21,9 @@ import torch
 if not torch.cuda.is_available():
     torch.cuda.is_available = MagicMock(return_value=False)
 
-from nodes import flashvsr, FlashVSRNodeInitPipe, FlashVSRNode, FlashVSRNodeAdv
+from nodes import flashvsr, FlashVSRNodeInitPipe, FlashVSRNode, FlashVSRNodeAdv, VAE_TYPES
 from src.pipelines.flashvsr_full import FlashVSRFullPipeline
+from src.models.wan_video_vae import WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae
 
 class TestFlashVSRNodes(unittest.TestCase):
     def test_pipeline_instantiation(self):
@@ -34,6 +35,62 @@ class TestFlashVSRNodes(unittest.TestCase):
         self.assertTrue(hasattr(FlashVSRNode, 'INPUT_TYPES'))
         self.assertTrue(hasattr(FlashVSRNodeAdv, 'INPUT_TYPES'))
         self.assertTrue(hasattr(FlashVSRNodeInitPipe, 'INPUT_TYPES'))
+
+    def test_vae_types_available(self):
+        """Test that VAE_TYPES is properly defined and contains expected values."""
+        self.assertIn("wan2.1", VAE_TYPES)
+        self.assertIn("wan2.2", VAE_TYPES)
+        self.assertIn("lightx2v", VAE_TYPES)
+        self.assertEqual(len(VAE_TYPES), 3)
+
+    def test_vae_type_in_node_input_types(self):
+        """Test that vae_type parameter is present in node INPUT_TYPES."""
+        init_types = FlashVSRNodeInitPipe.INPUT_TYPES()
+        self.assertIn('vae_type', init_types['required'])
+        
+        node_types = FlashVSRNode.INPUT_TYPES()
+        self.assertIn('vae_type', node_types['required'])
+
+    def test_vae_factory_function(self):
+        """Test the create_video_vae factory function."""
+        # Test wan2.1
+        vae1 = create_video_vae('wan2.1')
+        self.assertIsInstance(vae1, WanVideoVAE)
+        
+        # Test wan2.2
+        vae2 = create_video_vae('wan2.2')
+        self.assertIsInstance(vae2, Wan22VideoVAE)
+        
+        # Test lightx2v
+        vae3 = create_video_vae('lightx2v', use_full_arch=True)
+        self.assertIsInstance(vae3, LightX2VVAE)
+
+    def test_wan22_vae_initialization(self):
+        """Test Wan22VideoVAE initialization and basic attributes."""
+        vae = Wan22VideoVAE(z_dim=16, dim=96)
+        self.assertEqual(vae.vae_type, "wan2.2")
+        self.assertEqual(vae.upsampling_factor, 8)
+        self.assertIsNotNone(vae.model)
+
+    def test_lightx2v_vae_initialization(self):
+        """Test LightX2VVAE initialization and basic attributes."""
+        vae = LightX2VVAE(z_dim=16, dim=64, use_full_arch=True)
+        self.assertEqual(vae.vae_type, "lightx2v")
+        self.assertEqual(vae.upsampling_factor, 8)
+        self.assertIsNotNone(vae.model)
+
+    def test_wan22_use_wan21_stats(self):
+        """Test Wan22VideoVAE can switch to Wan2.1 statistics."""
+        vae = Wan22VideoVAE(z_dim=16, dim=96)
+        original_vae_type = vae.vae_type
+        vae.use_wan21_stats()
+        self.assertEqual(vae.vae_type, "wan2.1_compat")
+        self.assertNotEqual(vae.vae_type, original_vae_type)
+
+    def test_vae_factory_invalid_type(self):
+        """Test that factory raises error for invalid VAE type."""
+        with self.assertRaises(ValueError):
+            create_video_vae('invalid_vae_type')
 
     def test_full_pipeline_vram_optimization(self):
         # Verify our changes to load_models_to_device usage in FlashVSRFullPipeline

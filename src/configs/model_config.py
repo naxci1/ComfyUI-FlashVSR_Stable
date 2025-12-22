@@ -1,12 +1,13 @@
 from typing_extensions import Literal, TypeAlias
 
 from ..models.wan_video_dit import WanModel
-from ..models.wan_video_vae import WanVideoVAE
+from ..models.wan_video_vae import WanVideoVAE, Wan22VideoVAE, LightX2VVAE
 
 
 model_loader_configs = [
     # These configs are provided for detecting model type automatically.
     # The format is (state_dict_keys_hash, state_dict_keys_hash_with_shape, model_names, model_classes, model_resource)
+    # DiT models
     (None, "9269f8db9040a9d860eaca435be61814", ["wan_video_dit"], [WanModel], "civitai"),
     (None, "aafcfd9672c3a2456dc46e1cb6e52c70", ["wan_video_dit"], [WanModel], "civitai"),
     (None, "6bfcfb3b342cb286ce886889d519a77e", ["wan_video_dit"], [WanModel], "civitai"),
@@ -16,8 +17,15 @@ model_loader_configs = [
     (None, "efa44cddf936c70abd0ea28b6cbe946c", ["wan_video_dit"], [WanModel], "civitai"),
     (None, "3ef3b1f8e1dab83d5b71fd7b617f859f", ["wan_video_dit"], [WanModel], "civitai"),
     (None, "cb104773c6c2cb6df4f9529ad5c60d0b", ["wan_video_dit"], [WanModel], "diffusers"),
+    # Wan2.1 VAE (default)
     (None, "1378ea763357eea97acdef78e65d6d96", ["wan_video_vae"], [WanVideoVAE], "civitai"),
     (None, "ccc42284ea13e1ad04693284c7a09be6", ["wan_video_vae"], [WanVideoVAE], "civitai"),
+    # Wan2.2 VAE (same architecture, updated statistics for Wan2.2 training regime)
+    (None, "1378ea763357eea97acdef78e65d6d96", ["wan22_video_vae"], [Wan22VideoVAE], "civitai"),
+    (None, "ccc42284ea13e1ad04693284c7a09be6", ["wan22_video_vae"], [Wan22VideoVAE], "civitai"),
+    # LightX2V VAE (optimized lightweight VAE - reduced VRAM, faster inference)
+    (None, "1378ea763357eea97acdef78e65d6d96", ["lightx2v_video_vae"], [LightX2VVAE], "civitai"),
+    (None, "ccc42284ea13e1ad04693284c7a09be6", ["lightx2v_video_vae"], [LightX2VVAE], "civitai"),
 ]
 huggingface_model_loader_configs = [
     # These configs are provided for detecting model type automatically.

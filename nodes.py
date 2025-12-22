@@ -20,18 +20,21 @@ try:
     from .src.models.TCDecoder import build_tcdecoder
     from .src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
     from .src.models import wan_video_dit
-    from .src.models.wan_video_vae import WanVideoVAE
+    from .src.models.wan_video_vae import WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae
 except ImportError:
     from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashVSRTinyLongPipeline
     from src.models.TCDecoder import build_tcdecoder
     from src.models.utils import clean_vram, get_device_list, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
     from src.models import wan_video_dit
-    from src.models.wan_video_vae import WanVideoVAE
+    from src.models.wan_video_vae import WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae
 
 try:
     import safetensors.torch
 except ImportError:
     pass
+
+# Available VAE types for user selection
+VAE_TYPES = ["wan2.1", "wan2.2", "lightx2v"]
 
 device_choices = get_device_list()
 
@@ -190,7 +193,18 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def init_pipeline(model, mode, device, dtype, alt_vae="none"):
+def init_pipeline(model, mode, device, dtype, alt_vae="none", vae_type="wan2.1"):
+    """
+    Initialize FlashVSR pipeline with specified model and VAE type.
+    
+    Args:
+        model: Model name (FlashVSR or FlashVSR-v1.1)
+        mode: Pipeline mode (full, tiny, tiny-long)
+        device: Computation device
+        dtype: Torch dtype
+        alt_vae: Alternative VAE file path or "none" for built-in
+        vae_type: VAE type - "wan2.1", "wan2.2", or "lightx2v"
+    """
     model_download(model_name="JunhaoZhuang/"+model)
     model_path = os.path.join(folder_paths.models_dir, model)
     if not os.path.exists(model_path):
@@ -224,7 +238,17 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none"):
         if pipe.vae is None:
             log("ModelManager failed to load VAE. Attempting manual load...", message_type='warning', icon="⚠️")
             try:
-                pipe.vae = WanVideoVAE(z_dim=16, dim=96).to(device=device, dtype=dtype)
+                # Create VAE based on selected type
+                vae_type_lower = vae_type.lower()
+                if vae_type_lower == "wan2.2":
+                    pipe.vae = Wan22VideoVAE(z_dim=16, dim=96).to(device=device, dtype=dtype)
+                    log(f"Using Wan2.2 VAE (optimized normalization)", message_type='info', icon="🚀")
+                elif vae_type_lower == "lightx2v":
+                    pipe.vae = LightX2VVAE(z_dim=16, dim=64, use_full_arch=True).to(device=device, dtype=dtype)
+                    log(f"Using LightX2V VAE (optimized for VRAM)", message_type='info', icon="⚡")
+                else:
+                    pipe.vae = WanVideoVAE(z_dim=16, dim=96).to(device=device, dtype=dtype)
+                    log(f"Using Wan2.1 VAE (default)", message_type='info', icon="📦")
 
                 # Check for safetensors vs pth
                 if vae_path.endswith(".safetensors"):
@@ -242,6 +266,19 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none"):
             except Exception as e:
                 log(f"Failed to manually load VAE: {e}", message_type='error', icon="❌")
                 raise RuntimeError(f"Could not load VAE from {vae_path}")
+        else:
+            # If ModelManager loaded VAE, we may need to swap to a different VAE type
+            vae_type_lower = vae_type.lower()
+            if vae_type_lower == "wan2.2" and not isinstance(pipe.vae, Wan22VideoVAE):
+                log(f"Upgrading to Wan2.2 VAE with optimized normalization...", message_type='info', icon="🚀")
+                old_state = pipe.vae.state_dict()
+                pipe.vae = Wan22VideoVAE(z_dim=16, dim=96).to(device=device, dtype=dtype)
+                pipe.vae.load_state_dict(old_state)
+            elif vae_type_lower == "lightx2v" and not isinstance(pipe.vae, LightX2VVAE):
+                log(f"Switching to LightX2V VAE for reduced VRAM...", message_type='info', icon="⚡")
+                old_state = pipe.vae.state_dict()
+                pipe.vae = LightX2VVAE(z_dim=16, dim=64, use_full_arch=True).to(device=device, dtype=dtype)
+                pipe.vae.load_state_dict(old_state)
 
         pipe.vae.model.encoder = None
         pipe.vae.model.conv1 = None
@@ -268,8 +305,13 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none"):
     pipe.load_models_to_device(["dit","vae"])
     pipe.offload_model()
 
+    # Log VAE type information
+    vae_info = f"VAE Type: {vae_type}"
+    if hasattr(pipe, 'vae') and pipe.vae is not None:
+        vae_info += f" ({type(pipe.vae).__name__})"
+    
     log(f"Pipeline Initialized: Mode={mode}, Device={device}, Dtype={dtype}, Attention={wan_video_dit.ATTENTION_MODE}", message_type='info', icon="🔧")
-    log(f"Model: {model}, VAE: {'Built-in' if alt_vae == 'none' else alt_vae}", message_type='info', icon="📦")
+    log(f"Model: {model}, {vae_info}", message_type='info', icon="📦")
 
     return pipe
 
@@ -650,9 +692,13 @@ class FlashVSRNodeInitPipe:
                     "default": "tiny",
                     "tooltip": 'Operation mode. "tiny": faster, standard memory. "tiny-long": optimized for long videos (lower VRAM). "full": higher quality but max VRAM.'
                 }),
+                "vae_type": (VAE_TYPES, {
+                    "default": "wan2.1",
+                    "tooltip": 'VAE type: "wan2.1" (default), "wan2.2" (improved normalization), "lightx2v" (50% less VRAM, 2-3x faster).'
+                }),
                 "alt_vae": (["none"] + folder_paths.get_filename_list("vae"), {
                     "default": "none",
-                    "tooltip": 'Optional: Select an alternative VAE model to replace the built-in one. Only used in "full" mode.'
+                    "tooltip": 'Optional: Select an alternative VAE model file. Only used in "full" mode. VAE type settings still apply.'
                 }),
                 "force_offload": ("BOOLEAN", {
                     "default": True,
@@ -677,9 +723,9 @@ class FlashVSRNodeInitPipe:
     RETURN_NAMES = ("pipe",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Initializes the FlashVSR pipeline, loads models, and configures memory management settings.'
+    DESCRIPTION = 'Initializes the FlashVSR pipeline, loads models, and configures memory management settings. Now supports Wan2.2 VAE and LightX2V for optimized performance.'
     
-    def main(self, model, mode, alt_vae, force_offload, precision, device, attention_mode):
+    def main(self, model, mode, vae_type, alt_vae, force_offload, precision, device, attention_mode):
         _device = device
         if device == "auto":
             _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -710,7 +756,7 @@ class FlashVSRNodeInitPipe:
         except:
             dtype = torch.bfloat16
 
-        pipe = init_pipeline(model, mode, _device, dtype, alt_vae=alt_vae)
+        pipe = init_pipeline(model, mode, _device, dtype, alt_vae=alt_vae, vae_type=vae_type)
         return((pipe, force_offload),)
 
 class FlashVSRNodeAdv:
@@ -840,6 +886,10 @@ class FlashVSRNode:
                     "default": "tiny",
                     "tooltip": 'Operation mode. "tiny": faster, standard memory. "tiny-long": optimized for long videos (lower VRAM). "full": higher quality but max VRAM.'
                 }),
+                "vae_type": (VAE_TYPES, {
+                    "default": "wan2.1",
+                    "tooltip": 'VAE type: "wan2.1" (default), "wan2.2" (improved normalization), "lightx2v" (50% less VRAM, 2-3x faster).'
+                }),
                 "scale": ("INT", {
                     "default": 2,
                     "min": 2,
@@ -897,9 +947,9 @@ class FlashVSRNode:
     RETURN_NAMES = ("image",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Single-node easy usage for FlashVSR upscaling. Configure chunk size and tiling for best VRAM performance.'
+    DESCRIPTION = 'Single-node easy usage for FlashVSR upscaling. Now supports Wan2.2 VAE and LightX2V for optimized VRAM usage.'
     
-    def main(self, model, frames, mode, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu, resize_factor):
+    def main(self, model, frames, mode, vae_type, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu, resize_factor):
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"
         if _device == "auto" or _device not in device_choices:
             raise RuntimeError("No devices found to run FlashVSR!")
@@ -909,7 +959,7 @@ class FlashVSRNode:
             
         wan_video_dit.ATTENTION_MODE = attention_mode
             
-        pipe = init_pipeline(model, mode, _device, torch.float16)
+        pipe = init_pipeline(model, mode, _device, torch.float16, vae_type=vae_type)
         output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor)
         return(output,)
 
