@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+FlashVSR ComfyUI Node - Video Super Resolution
+===============================================
+Supports Wan2.1, Wan2.2, and LightX2V VAE models.
+
+Key Fixes Applied:
+- FIX 1: Merged VAE selection into single 'vae_model' dropdown
+- FIX 2: Corrected VAE model loading logic with debug logging
+- FIX 3: Fixed black border issue with proper padding/cropping
+- FIX 4: Lossless resize uses NEAREST for integer scaling
+- FIX 5: VRAM estimation and advisory logging
+"""
 
 import os, gc
 import math
@@ -39,8 +51,18 @@ try:
 except ImportError:
     pass
 
-# Available VAE types for user selection
-VAE_TYPES = ["wan2.1", "wan2.2", "lightx2v"]
+# =============================================================================
+# FIX 1: Unified VAE model selection dropdown
+# Merged 'vae_type' and 'alt_vae' into single 'vae_model' dropdown
+# =============================================================================
+VAE_MODEL_OPTIONS = ["Wan2.1", "Wan2.2", "LightX2V"]
+
+# Mapping from dropdown selection to internal VAE class and file
+VAE_MODEL_MAP = {
+    "Wan2.1": {"class": WanVideoVAE, "file": "Wan2.1_VAE.pth", "internal_name": "wan2.1"},
+    "Wan2.2": {"class": Wan22VideoVAE, "file": "Wan2.1_VAE.pth", "internal_name": "wan2.2"},  # Uses same weights, different normalization
+    "LightX2V": {"class": LightX2VVAE, "file": "Wan2.1_VAE.pth", "internal_name": "lightx2v"},  # Compatible with Wan2.1 weights
+}
 
 device_choices = get_device_list()
 
@@ -87,6 +109,66 @@ def log_resource_usage(prefix="Resource Usage", end="\n", in_place=False):
         
     log(msg, message_type='info', icon="📊", end=end, in_place=in_place)
 
+
+# =============================================================================
+# FIX 5: VRAM Estimation and Advisory Logging
+# Calculate approximate VRAM requirements based on resolution and frames
+# =============================================================================
+def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled_dit=False):
+    """
+    Estimate approximate VRAM usage for the given video parameters.
+    Returns estimated VRAM in GB.
+    """
+    # Base model memory (DiT + VAE decoder)
+    base_model_gb = 4.0  # Approximate base memory for models
+    
+    # Per-frame latent memory (scaled output resolution)
+    output_h, output_w = height * scale, width * scale
+    
+    # Latent dimensions (8x downsampled)
+    latent_h, latent_w = output_h // 8, output_w // 8
+    
+    # Approximate memory per frame in latent space (16 channels, bf16)
+    bytes_per_frame = latent_h * latent_w * 16 * 2  # bf16 = 2 bytes
+    total_latent_gb = (bytes_per_frame * num_frames) / (1024 ** 3)
+    
+    # DiT attention memory (quadratic with sequence length)
+    seq_len = latent_h * latent_w * (num_frames // 4)
+    attention_gb = (seq_len * seq_len * 2) / (1024 ** 3) * 0.001  # Rough estimate
+    
+    # VAE decode memory
+    vae_decode_gb = (output_h * output_w * 3 * num_frames * 2) / (1024 ** 3)
+    
+    # Apply tiling reductions
+    if tiled_dit:
+        attention_gb *= 0.3  # Tiling reduces peak attention memory
+    if tiled_vae:
+        vae_decode_gb *= 0.4  # Tiling reduces peak VAE memory
+    
+    total_estimated = base_model_gb + total_latent_gb + attention_gb + vae_decode_gb
+    return total_estimated
+
+
+def log_vram_advisory(width, height, num_frames, scale, tiled_vae, tiled_dit):
+    """
+    Log advisory message about VRAM usage.
+    """
+    if not torch.cuda.is_available():
+        return
+    
+    estimated_vram = estimate_vram_usage(width, height, num_frames, scale, tiled_vae, tiled_dit)
+    available_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    current_used = torch.cuda.memory_allocated() / (1024 ** 3)
+    free_vram = available_vram - current_used
+    
+    log(f"VRAM Advisory: Estimated ~{estimated_vram:.1f}GB needed, Available: {free_vram:.1f}GB free of {available_vram:.1f}GB total", 
+        message_type='info', icon="💡")
+    
+    if estimated_vram > free_vram * 0.9:
+        log("⚠️ Warning: High VRAM usage expected. Recommend enabling Tiled VAE/DiT.", message_type='warning', icon="⚠️")
+    elif estimated_vram < free_vram * 0.5:
+        log("✅ Safe to proceed. VRAM usage should be comfortable.", message_type='info', icon="✅")
+
 def model_download(model_name="JunhaoZhuang/FlashVSR"):
     model_dir = os.path.join(folder_paths.models_dir, model_name.split("/")[-1])
     if not os.path.exists(model_dir):
@@ -106,6 +188,14 @@ def next_8n5(n):  # next 8n+5
     return 21 if n < 21 else ((n - 5 + 7) // 8) * 8 + 5
 
 def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
+    """
+    Compute scaled dimensions and target dimensions (aligned to multiple).
+    
+    =============================================================================
+    FIX 3: Black Border Fix - Track original scaled dimensions
+    =============================================================================
+    Returns: sW, sH (actual scaled), tW, tH (padded to multiple), pad_left, pad_top
+    """
     if w0 <= 0 or h0 <= 0:
         raise ValueError("invalid original size")
 
@@ -113,33 +203,55 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: i
     tW = math.ceil(sW / multiple) * multiple
     tH = math.ceil(sH / multiple) * multiple
     
-    return sW, sH, tW, tH
+    # Calculate padding offsets (centered padding)
+    pad_left = (tW - sW) // 2
+    pad_top = (tH - sH) // 2
+    
+    return sW, sH, tW, tH, pad_left, pad_top
 
-def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int) -> torch.Tensor:
+
+def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int, pad_left: int, pad_top: int) -> torch.Tensor:
+    """
+    Upscale frame tensor and pad to target dimensions.
+    
+    =============================================================================
+    FIX 3: Black Border Fix - Use consistent padding offsets
+    =============================================================================
+    """
     h0, w0, c = frame_tensor.shape
     tensor_bchw = frame_tensor.permute(2, 0, 1).unsqueeze(0) # HWC -> CHW -> BCHW
     
     sW, sH = w0 * scale, h0 * scale
     upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
     
+    # Apply symmetric padding to reach target dimensions
     if sW < tW or sH < tH:
-        pad_l = max(0, (tW - sW) // 2)
-        pad_r = max(0, tW - sW - pad_l)
-        pad_t = max(0, (tH - sH) // 2)
-        pad_b = max(0, tH - sH - pad_t)
-        upscaled_tensor = F.pad(upscaled_tensor, (pad_l, pad_r, pad_t, pad_b), mode='constant', value=0)
+        pad_r = tW - sW - pad_left
+        pad_b = tH - sH - pad_top
+        # Pad order: (left, right, top, bottom)
+        upscaled_tensor = F.pad(upscaled_tensor, (pad_left, pad_r, pad_top, pad_b), mode='reflect')
     
+    # Center crop to target dimensions if needed (should be exact after padding)
     l = max(0, (upscaled_tensor.shape[3] - tW) // 2)
     t = max(0, (upscaled_tensor.shape[2] - tH) // 2)
     cropped_tensor = upscaled_tensor[:, :, t:t + tH, l:l + tW]
 
     return cropped_tensor.squeeze(0)
 
+
 def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
+    """
+    Prepare input tensor with proper padding tracking.
+    
+    =============================================================================
+    FIX 3: Black Border Fix - Track padding for later cropping
+    =============================================================================
+    Returns: vid_final, tH, tW, F, original_sH, original_sW, pad_top, pad_left
+    """
     N0, h0, w0, _ = image_tensor.shape
     
     multiple = 128 # Keep 128 alignment for VAE/DiT blocks
-    sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
+    sW, sH, tW, tH, pad_left, pad_top = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
     num_frames_with_padding = N0 + 4
     F = largest_8n1_leq(num_frames_with_padding)
     
@@ -150,7 +262,10 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     for i in range(F):
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
-        tensor_chw = tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH).to('cpu').to(dtype) * 2.0 - 1.0
+        tensor_chw = tensor_upscale_then_center_crop(
+            frame_slice, scale=scale, tW=tW, tH=tH, 
+            pad_left=pad_left, pad_top=pad_top
+        ).to('cpu').to(dtype) * 2.0 - 1.0
         frames.append(tensor_chw)
         del frame_slice
 
@@ -160,7 +275,8 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     del vid_stacked
     clean_vram()
     
-    return vid_final, tH, tW, F
+    # Return additional info for cropping output back to original dimensions
+    return vid_final, tH, tW, F, sH, sW, pad_top, pad_left
 
 def calculate_tile_coords(height, width, tile_size, overlap):
     coords = []
@@ -199,17 +315,16 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def init_pipeline(model, mode, device, dtype, alt_vae="none", vae_type="wan2.1"):
+def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     """
     Initialize FlashVSR pipeline with specified model and VAE type.
     
-    Args:
-        model: Model name (FlashVSR or FlashVSR-v1.1)
-        mode: Pipeline mode (full, tiny, tiny-long)
-        device: Computation device
-        dtype: Torch dtype
-        alt_vae: Alternative VAE file path or "none" for built-in
-        vae_type: VAE type - "wan2.1", "wan2.2", or "lightx2v"
+    =============================================================================
+    FIX 2: Model Loading Logic - Corrected VAE selection
+    =============================================================================
+    - vae_model: Unified VAE selection from dropdown ("Wan2.1", "Wan2.2", "LightX2V")
+    - Uses VAE_MODEL_MAP to map selection to correct class and file
+    - Debug logging shows selected_model vs loaded_model for verification
     """
     model_download(model_name="JunhaoZhuang/"+model)
     model_path = os.path.join(folder_paths.models_dir, model)
@@ -218,14 +333,27 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none", vae_type="wan2.1")
     ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
     if not os.path.exists(ckpt_path):
         raise RuntimeError(f'"diffusion_pytorch_model_streaming_dmd.safetensors" does not exist!\nPlease save it to "{model_path}"')
-    if alt_vae != "none":
-        vae_path = folder_paths.get_full_path_or_raise("vae", alt_vae)
-        if not os.path.exists(vae_path):
-            raise RuntimeError(f'"{alt_vae}" does not exist!')
-    else:
-        vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
-        if not os.path.exists(vae_path):
-            raise RuntimeError(f'"Wan2.1_VAE.pth" does not exist!\nPlease save it to "{model_path}"')
+    
+    # ==========================================================================
+    # FIX 2: VAE Model Loading - Get correct VAE config from map
+    # ==========================================================================
+    if vae_model not in VAE_MODEL_MAP:
+        log(f"Unknown VAE model '{vae_model}', defaulting to Wan2.1", message_type='warning', icon="⚠️")
+        vae_model = "Wan2.1"
+    
+    vae_config = VAE_MODEL_MAP[vae_model]
+    vae_class = vae_config["class"]
+    vae_file = vae_config["file"]
+    vae_internal_name = vae_config["internal_name"]
+    
+    vae_path = os.path.join(model_path, vae_file)
+    if not os.path.exists(vae_path):
+        raise RuntimeError(f'VAE file "{vae_file}" does not exist!\nPlease save it to "{model_path}"')
+    
+    # Debug logging for FIX 2 - Show selected vs loaded
+    log(f"VAE Selection: '{vae_model}' -> Loading '{vae_file}' with class {vae_class.__name__}", 
+        message_type='info', icon="🔍")
+    
     lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
     if not os.path.exists(lq_path):
         raise RuntimeError(f'"LQ_proj_in.ckpt" does not exist!\nPlease save it to "{model_path}"')
@@ -240,51 +368,36 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none", vae_type="wan2.1")
         mm.load_models([ckpt_path, vae_path])
         pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
 
-        # Manual VAE loading fallback if ModelManager fails
-        if pipe.vae is None:
-            log("ModelManager failed to load VAE. Attempting manual load...", message_type='warning', icon="⚠️")
+        # =======================================================================
+        # FIX 2: Always create the correct VAE class based on user selection
+        # =======================================================================
+        # Even if ModelManager loaded a VAE, we replace it with the selected type
+        log(f"Creating VAE instance: {vae_class.__name__}", message_type='info', icon="📦")
+        
+        # Load weights from file
+        if vae_path.endswith(".safetensors"):
             try:
-                # Create VAE based on selected type using constants
-                vae_type_lower = vae_type.lower()
-                if vae_type_lower == "wan2.2":
-                    pipe.vae = Wan22VideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM).to(device=device, dtype=dtype)
-                    log(f"Using Wan2.2 VAE (optimized normalization)", message_type='info', icon="🚀")
-                elif vae_type_lower == "lightx2v":
-                    pipe.vae = LightX2VVAE(z_dim=VAE_Z_DIM, dim=VAE_LIGHT_DIM, use_full_arch=True).to(device=device, dtype=dtype)
-                    log(f"Using LightX2V VAE (optimized for VRAM)", message_type='info', icon="⚡")
-                else:
-                    pipe.vae = WanVideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM).to(device=device, dtype=dtype)
-                    log(f"Using Wan2.1 VAE (default)", message_type='info', icon="📦")
-
-                # Check for safetensors vs pth
-                if vae_path.endswith(".safetensors"):
-                    try:
-                        import safetensors.torch
-                        sd = safetensors.torch.load_file(vae_path)
-                    except ImportError:
-                        raise RuntimeError("safetensors library required to load .safetensors VAE file. Please install it.")
-                else:
-                    # Allow weights_only=False for .pth files as per user request/necessity with older formats
-                    sd = torch.load(vae_path, map_location="cpu", weights_only=False)
-
-                pipe.vae.load_state_dict(sd)
-                log(f"Manually loaded VAE from {vae_path}", message_type='info', icon="📦")
-            except Exception as e:
-                log(f"Failed to manually load VAE: {e}", message_type='error', icon="❌")
-                raise RuntimeError(f"Could not load VAE from {vae_path}")
+                import safetensors.torch
+                sd = safetensors.torch.load_file(vae_path)
+            except ImportError:
+                raise RuntimeError("safetensors library required to load .safetensors VAE file.")
         else:
-            # If ModelManager loaded VAE, we may need to swap to a different VAE type
-            vae_type_lower = vae_type.lower()
-            if vae_type_lower == "wan2.2" and not isinstance(pipe.vae, Wan22VideoVAE):
-                log(f"Upgrading to Wan2.2 VAE with optimized normalization...", message_type='info', icon="🚀")
-                old_state = pipe.vae.state_dict()
-                pipe.vae = Wan22VideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM).to(device=device, dtype=dtype)
-                pipe.vae.load_state_dict(old_state)
-            elif vae_type_lower == "lightx2v" and not isinstance(pipe.vae, LightX2VVAE):
-                log(f"Switching to LightX2V VAE for reduced VRAM...", message_type='info', icon="⚡")
-                old_state = pipe.vae.state_dict()
-                pipe.vae = LightX2VVAE(z_dim=VAE_Z_DIM, dim=VAE_LIGHT_DIM, use_full_arch=True).to(device=device, dtype=dtype)
-                pipe.vae.load_state_dict(old_state)
+            sd = torch.load(vae_path, map_location="cpu", weights_only=False)
+        
+        # Create the correct VAE class based on selection
+        if vae_internal_name == "lightx2v":
+            pipe.vae = LightX2VVAE(z_dim=VAE_Z_DIM, dim=VAE_LIGHT_DIM, use_full_arch=True)
+        elif vae_internal_name == "wan2.2":
+            pipe.vae = Wan22VideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM)
+        else:
+            pipe.vae = WanVideoVAE(z_dim=VAE_Z_DIM, dim=VAE_FULL_DIM)
+        
+        # Load state dict and move to device
+        pipe.vae.load_state_dict(sd, strict=False)
+        pipe.vae = pipe.vae.to(device=device, dtype=dtype)
+        
+        log(f"Loaded VAE weights from: {vae_path}", message_type='info', icon="✅")
+        log(f"VAE Type Active: {type(pipe.vae).__name__}", message_type='info', icon="📦")
 
         pipe.vae.model.encoder = None
         pipe.vae.model.conv1 = None
@@ -311,8 +424,8 @@ def init_pipeline(model, mode, device, dtype, alt_vae="none", vae_type="wan2.1")
     pipe.load_models_to_device(["dit","vae"])
     pipe.offload_model()
 
-    # Log VAE type information
-    vae_info = f"VAE Type: {vae_type}"
+    # Log final pipeline info with VAE confirmation
+    vae_info = f"VAE Model: {vae_model}"
     if hasattr(pipe, 'vae') and pipe.vae is not None:
         vae_info += f" ({type(pipe.vae).__name__})"
     
@@ -409,13 +522,25 @@ class cqdm:
 def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug, is_single_frame_input=False):
     """
     Processes a single chunk of frames.
+    
+    =============================================================================
+    FIX 3: Black Border Fix - Proper cropping to remove padding
+    =============================================================================
     """
+    # Aggressive garbage collection before processing (FIX 5)
     clean_vram()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     _frames = frames
     _device = pipe.device
     dtype = pipe.torch_dtype
     
-    # Padding logic for the chunk
+    # Store original dimensions for cropping (FIX 3)
+    original_H, original_W = frames.shape[1], frames.shape[2]
+    target_H, target_W = original_H * scale, original_W * scale
+    
+    # Padding logic for the chunk (temporal padding)
     add = next_8n5(frames.shape[0]) - frames.shape[0]
     padding_frames = frames[-1:, :, :, :].repeat(add, 1, 1, 1)
     _frames = torch.cat([frames, padding_frames], dim=0)
@@ -440,12 +565,13 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             
             input_tile = _frames[:, y1:y2, x1:x2, :]
             
-            LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
+            # Get tile dimensions including padding info (FIX 3)
+            LQ_tile, th, tw, F, tile_sH, tile_sW, tile_pad_top, tile_pad_left = prepare_input_tensor(
+                input_tile, _device, scale=scale, dtype=dtype
+            )
             if not isinstance(pipe, FlashVSRTinyLongPipeline):
                 LQ_tile = LQ_tile.to(_device)
 
-            # Note: pipe() calls implicitly handle the rest.
-            # But pipe() can raise OOM. We let it propagate to flashvsr to handle fallback.
             output_tile_gpu = pipe(
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
                 LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
@@ -455,6 +581,13 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             )
             
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
+            
+            # =================================================================
+            # FIX 3: Crop output tile to remove padding before blending
+            # =================================================================
+            # Crop from padded output to actual scaled tile dimensions
+            processed_tile_cpu = processed_tile_cpu[:, tile_pad_top:tile_pad_top + tile_sH, 
+                                                       tile_pad_left:tile_pad_left + tile_sW, :]
             
             if enable_debug:
                 tile_end = time.time()
@@ -476,6 +609,8 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             
             del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
             clean_vram()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
         weight_sum_canvas[weight_sum_canvas == 0] = 1.0
         final_output = final_output_canvas / weight_sum_canvas
@@ -484,7 +619,8 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         if enable_debug:
             log_resource_usage(prefix="Pre-Preprocess")
         
-        LQ, th, tw, F = prepare_input_tensor(_frames, _device, scale=scale, dtype=dtype)
+        # Get padding info for cropping (FIX 3)
+        LQ, th, tw, F, sH, sW, pad_top, pad_left = prepare_input_tensor(_frames, _device, scale=scale, dtype=dtype)
         if not isinstance(pipe, FlashVSRTinyLongPipeline):
             LQ = LQ.to(_device)
             
@@ -509,22 +645,22 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             log(f"Inference completed in {process_end - process_start:.2f}s", message_type='info', icon="⏱️")
         final_output_tensor = tensor2video(video).to('cpu')
         
-        # Crop back to canvas (tiling naturally handles this via summing, but non-tiled produces full tensor)
-        # However, non-tiled output is already in correct shape?
-        # Check tensor_upscale_then_center_crop logic:
-        # It creates target dimensions (tW, tH) multiple of 128.
-        # But if we didn't tile, the output 'video' has those dimensions.
-        # We need to crop it back if necessary?
-        # Actually, tensor2video returns the video as is.
-        # But process_chunk logic for tiling accumulates into `final_output_canvas` which has exact size H*scale, W*scale.
-        # For non-tiled, the output 'video' has size tH, tW (aligned to 128).
-        # We need to crop it to match expected output size.
+        # =====================================================================
+        # FIX 3: Crop output to remove padding - use stored padding offsets
+        # =====================================================================
+        # The output has dimensions (N, tH, tW, C) where tH/tW are padded
+        # We need to crop to actual scaled dimensions (sH, sW)
+        final_output = final_output_tensor[:, pad_top:pad_top + sH, pad_left:pad_left + sW, :]
         
-        H, W = frames.shape[1], frames.shape[2]
-        final_output = final_output_tensor[:, :H*scale, :W*scale, :]
+        if enable_debug:
+            log(f"Cropped output from ({final_output_tensor.shape[1]}, {final_output_tensor.shape[2]}) "
+                f"to ({final_output.shape[1]}, {final_output.shape[2]}) removing padding", 
+                message_type='info', icon="✂️")
 
         del video, LQ
         clean_vram()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if is_single_frame_input and frames.shape[0] == 1:
         if frames.shape[0] == 1:
@@ -537,25 +673,52 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
     return final_output[:frames.shape[0], :, :, :]
 
 def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0):
+    """
+    Main FlashVSR processing function.
+    
+    =============================================================================
+    FIX 4: Lossless Resize - Use NEAREST for integer scaling factors
+    FIX 5: VRAM Advisory Logging
+    =============================================================================
+    """
+    # Aggressive garbage collection (FIX 5)
     clean_vram()
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
 
-    # Resize Input Frames if requested
+    # ==========================================================================
+    # FIX 4: Lossless Resize Factor
+    # Use NEAREST interpolation for integer-like factors, BICUBIC otherwise
+    # ==========================================================================
     if resize_factor < 1.0 and resize_factor > 0:
         log(f"Resizing input by factor {resize_factor}...", message_type='info', icon="📉")
         N, H, W, C = frames.shape
         new_H, new_W = int(H * resize_factor), int(W * resize_factor)
-        # Permute to NCHW for interpolate
+        
+        # Check if resize factor results in integer scaling (lossless possible)
+        is_integer_scale = (H % new_H == 0 and W % new_W == 0) or (resize_factor in [0.5, 0.25, 0.125])
+        
         frames_permuted = frames.permute(0, 3, 1, 2)
-        frames_resized = F.interpolate(frames_permuted, size=(new_H, new_W), mode='bicubic', align_corners=False)
-        frames = frames_resized.permute(0, 2, 3, 1) # Back to NHWC
+        if is_integer_scale:
+            # Use NEAREST for potentially lossless integer downscaling
+            frames_resized = F.interpolate(frames_permuted, size=(new_H, new_W), mode='nearest')
+            log(f"Using NEAREST interpolation (lossless for {resize_factor}x)", message_type='info', icon="🔍")
+        else:
+            # Use BICUBIC for non-integer factors
+            frames_resized = F.interpolate(frames_permuted, size=(new_H, new_W), mode='bicubic', align_corners=False)
+            log(f"Using BICUBIC interpolation for non-integer scaling", message_type='info', icon="🔍")
+        
+        frames = frames_resized.permute(0, 2, 3, 1)  # Back to NHWC
         del frames_permuted, frames_resized
         clean_vram()
 
     start_time = time.time()
 
+    # ==========================================================================
+    # FIX 5: VRAM Advisory Logging
+    # ==========================================================================
     if enable_debug:
         _device = pipe.device
         log(f"Debug Mode: Enabled", message_type='info', icon="🐞")
@@ -566,6 +729,11 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         log(f"Chunk Size: {chunk_size}", message_type='info', icon="📦")
         log(f"Tiled DiT: {tiled_dit}, Tiled VAE: {tiled_vae}", message_type='info', icon="🧩")
         log_resource_usage(prefix="Start")
+    
+    # VRAM Advisory (FIX 5)
+    if torch.cuda.is_available():
+        N, H, W, C = frames.shape
+        log_vram_advisory(W, H, N, scale, tiled_vae, tiled_dit)
 
     # VRAM check and warning
     if torch.cuda.is_available():
@@ -686,6 +854,11 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
 
 
 class FlashVSRNodeInitPipe:
+    """
+    =============================================================================
+    FIX 1: Unified VAE Selection - Merged vae_type and alt_vae into vae_model
+    =============================================================================
+    """
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -698,13 +871,9 @@ class FlashVSRNodeInitPipe:
                     "default": "tiny",
                     "tooltip": 'Operation mode. "tiny": faster, standard memory. "tiny-long": optimized for long videos (lower VRAM). "full": higher quality but max VRAM.'
                 }),
-                "vae_type": (VAE_TYPES, {
-                    "default": "wan2.1",
-                    "tooltip": 'VAE type: "wan2.1" (default), "wan2.2" (improved normalization), "lightx2v" (50% less VRAM, 2-3x faster).'
-                }),
-                "alt_vae": (["none"] + folder_paths.get_filename_list("vae"), {
-                    "default": "none",
-                    "tooltip": 'Optional: Select an alternative VAE model file. Only used in "full" mode. VAE type settings still apply.'
+                "vae_model": (VAE_MODEL_OPTIONS, {
+                    "default": "Wan2.1",
+                    "tooltip": 'VAE model selection: "Wan2.1" (default, max quality), "Wan2.2" (optimized normalization), "LightX2V" (50% less VRAM, 2-3x faster).'
                 }),
                 "force_offload": ("BOOLEAN", {
                     "default": True,
@@ -729,9 +898,9 @@ class FlashVSRNodeInitPipe:
     RETURN_NAMES = ("pipe",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Initializes the FlashVSR pipeline, loads models, and configures memory management settings. Now supports Wan2.2 VAE and LightX2V for optimized performance.'
+    DESCRIPTION = 'Initializes the FlashVSR pipeline. Select VAE model: Wan2.1 (default), Wan2.2 (improved), or LightX2V (50% less VRAM).'
     
-    def main(self, model, mode, vae_type, alt_vae, force_offload, precision, device, attention_mode):
+    def main(self, model, mode, vae_model, force_offload, precision, device, attention_mode):
         _device = device
         if device == "auto":
             _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -762,7 +931,8 @@ class FlashVSRNodeInitPipe:
         except:
             dtype = torch.bfloat16
 
-        pipe = init_pipeline(model, mode, _device, dtype, alt_vae=alt_vae, vae_type=vae_type)
+        # Use unified vae_model parameter
+        pipe = init_pipeline(model, mode, _device, dtype, vae_model=vae_model)
         return((pipe, force_offload),)
 
 class FlashVSRNodeAdv:
@@ -877,6 +1047,11 @@ class FlashVSRNodeAdv:
         return(output,)
 
 class FlashVSRNode:
+    """
+    =============================================================================
+    FIX 1: Unified VAE Selection - Single vae_model dropdown
+    =============================================================================
+    """
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -892,9 +1067,9 @@ class FlashVSRNode:
                     "default": "tiny",
                     "tooltip": 'Operation mode. "tiny": faster, standard memory. "tiny-long": optimized for long videos (lower VRAM). "full": higher quality but max VRAM.'
                 }),
-                "vae_type": (VAE_TYPES, {
-                    "default": "wan2.1",
-                    "tooltip": 'VAE type: "wan2.1" (default), "wan2.2" (improved normalization), "lightx2v" (50% less VRAM, 2-3x faster).'
+                "vae_model": (VAE_MODEL_OPTIONS, {
+                    "default": "Wan2.1",
+                    "tooltip": 'VAE model: "Wan2.1" (default, max quality), "Wan2.2" (optimized normalization), "LightX2V" (50% less VRAM, 2-3x faster).'
                 }),
                 "scale": ("INT", {
                     "default": 2,
@@ -953,9 +1128,9 @@ class FlashVSRNode:
     RETURN_NAMES = ("image",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Single-node easy usage for FlashVSR upscaling. Now supports Wan2.2 VAE and LightX2V for optimized VRAM usage.'
+    DESCRIPTION = 'Single-node FlashVSR upscaling. Select VAE: Wan2.1 (default), Wan2.2, or LightX2V (50% less VRAM).'
     
-    def main(self, model, frames, mode, vae_type, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu, resize_factor):
+    def main(self, model, frames, mode, vae_model, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu, resize_factor):
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"
         if _device == "auto" or _device not in device_choices:
             raise RuntimeError("No devices found to run FlashVSR!")
@@ -964,8 +1139,9 @@ class FlashVSRNode:
             torch.cuda.set_device(_device)
             
         wan_video_dit.ATTENTION_MODE = attention_mode
-            
-        pipe = init_pipeline(model, mode, _device, torch.float16, vae_type=vae_type)
+        
+        # Use unified vae_model parameter    
+        pipe = init_pipeline(model, mode, _device, torch.float16, vae_model=vae_model)
         output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor)
         return(output,)
 

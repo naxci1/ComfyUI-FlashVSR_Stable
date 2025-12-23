@@ -21,7 +21,7 @@ import torch
 if not torch.cuda.is_available():
     torch.cuda.is_available = MagicMock(return_value=False)
 
-from nodes import flashvsr, FlashVSRNodeInitPipe, FlashVSRNode, FlashVSRNodeAdv, VAE_TYPES
+from nodes import flashvsr, FlashVSRNodeInitPipe, FlashVSRNode, FlashVSRNodeAdv, VAE_MODEL_OPTIONS, VAE_MODEL_MAP
 from src.pipelines.flashvsr_full import FlashVSRFullPipeline
 from src.models.wan_video_vae import WanVideoVAE, Wan22VideoVAE, LightX2VVAE, create_video_vae
 
@@ -36,20 +36,36 @@ class TestFlashVSRNodes(unittest.TestCase):
         self.assertTrue(hasattr(FlashVSRNodeAdv, 'INPUT_TYPES'))
         self.assertTrue(hasattr(FlashVSRNodeInitPipe, 'INPUT_TYPES'))
 
-    def test_vae_types_available(self):
-        """Test that VAE_TYPES is properly defined and contains expected values."""
-        self.assertIn("wan2.1", VAE_TYPES)
-        self.assertIn("wan2.2", VAE_TYPES)
-        self.assertIn("lightx2v", VAE_TYPES)
-        self.assertEqual(len(VAE_TYPES), 3)
+    def test_vae_model_options_available(self):
+        """Test that VAE_MODEL_OPTIONS is properly defined and contains expected values."""
+        self.assertIn("Wan2.1", VAE_MODEL_OPTIONS)
+        self.assertIn("Wan2.2", VAE_MODEL_OPTIONS)
+        self.assertIn("LightX2V", VAE_MODEL_OPTIONS)
+        self.assertEqual(len(VAE_MODEL_OPTIONS), 3)
+    
+    def test_vae_model_map_configured(self):
+        """Test that VAE_MODEL_MAP is correctly configured."""
+        self.assertIn("Wan2.1", VAE_MODEL_MAP)
+        self.assertIn("Wan2.2", VAE_MODEL_MAP)
+        self.assertIn("LightX2V", VAE_MODEL_MAP)
+        
+        # Test each entry has required keys
+        for key, value in VAE_MODEL_MAP.items():
+            self.assertIn("class", value)
+            self.assertIn("file", value)
+            self.assertIn("internal_name", value)
 
-    def test_vae_type_in_node_input_types(self):
-        """Test that vae_type parameter is present in node INPUT_TYPES."""
+    def test_vae_model_in_node_input_types(self):
+        """Test that vae_model parameter is present in node INPUT_TYPES."""
         init_types = FlashVSRNodeInitPipe.INPUT_TYPES()
-        self.assertIn('vae_type', init_types['required'])
+        self.assertIn('vae_model', init_types['required'])
+        # Ensure old parameters are removed
+        self.assertNotIn('vae_type', init_types['required'])
+        self.assertNotIn('alt_vae', init_types['required'])
         
         node_types = FlashVSRNode.INPUT_TYPES()
-        self.assertIn('vae_type', node_types['required'])
+        self.assertIn('vae_model', node_types['required'])
+        self.assertNotIn('vae_type', node_types['required'])
 
     def test_vae_factory_function(self):
         """Test the create_video_vae factory function."""
