@@ -206,9 +206,9 @@ def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled
     # Frames to process at once (if chunked, use chunk_size)
     effective_frames = chunk_size if chunk_size > 0 and chunk_size <= num_frames else num_frames
     
-    # Input tensor size (4 bytes per float32, though we use bf16/fp16)
-    # Formula: (Input_Tensor_Size * 4 bytes) * Safety_Factor
-    input_tensor_bytes = output_h * output_w * 3 * effective_frames * 4  # 4 bytes for float32
+    # Input tensor size - use 4 bytes to account for float32 intermediates during processing
+    # Even though final tensors are bf16/fp16, operations often use float32 internally
+    input_tensor_bytes = output_h * output_w * 3 * effective_frames * 4
     input_tensor_gb = (input_tensor_bytes * SAFETY_FACTOR) / (1024 ** 3)
     
     # Approximate memory per frame in latent space (16 channels, bf16)
