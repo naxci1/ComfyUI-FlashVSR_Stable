@@ -795,6 +795,18 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
 
         pipe.vae.model.encoder = None
         pipe.vae.model.conv1 = None
+        
+        # =======================================================================
+        # FIX: Load TCDecoder for Full Mode (official FlashVSR approach)
+        # The official FlashVSR uses TCDecoder for all modes with LQ conditioning.
+        # This is critical because TCDecoder.decode_video() takes a `cond` parameter
+        # that enables proper video super-resolution with low-quality guidance.
+        # =======================================================================
+        multi_scale_channels = [512, 256, 128, 128]
+        pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, device=device, dtype=dtype, new_latent_channels=16+768)
+        mis = pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device, weights_only=False), strict=False)
+        pipe.TCDecoder.clean_mem()
+        log(f"Loaded TCDecoder for Full Mode (official FlashVSR approach)", message_type='info', icon="✅")
     else:
         mm.load_models([ckpt_path])
         if mode == "tiny":
