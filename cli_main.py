@@ -539,7 +539,7 @@ def main():
         kv_ratio=args.kv_ratio,
         local_range=args.local_range,
         seed=args.seed,
-        force_offload=keep_models_on_cpu,  # This parameter controls model offloading
+        force_offload=keep_models_on_cpu,  # flashvsr() uses force_offload param for CPU offloading
         enable_debug=args.enable_debug,
         chunk_size=args.frame_chunk_size,
         resize_factor=args.resize_factor,

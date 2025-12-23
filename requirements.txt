@@ -11,3 +11,4 @@ triton-windows; platform_system=="Windows"
 sageattention
 flash-attn --no-build-isolation; platform_system!="Windows"
 psutil
+opencv-python>=4.8.1.78

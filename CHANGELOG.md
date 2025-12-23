@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added comprehensive CLI arguments reference table to README.md with all parameter descriptions
 
+### 🛠 Dependencies
+
+- Added `opencv-python>=4.8.1.78` to requirements.txt for CLI video I/O support
+
 ---
 
 ## [1.2.0] - 2025-12-23
