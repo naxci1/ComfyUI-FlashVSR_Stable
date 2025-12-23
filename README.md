@@ -191,6 +191,89 @@ Hover over any input in ComfyUI to see tooltips. Full parameter list:
 
 ---
 
+## 💻 Command-Line Interface (CLI)
+
+FlashVSR includes a full-featured CLI that mirrors all ComfyUI node parameters for standalone video upscaling.
+
+### Quick Start
+
+```bash
+# Basic 2x upscale
+python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2
+
+# 4x upscale with tiling for lower VRAM
+python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 4 \
+    --tiled_vae --tiled_dit --tile_size 256 --tile_overlap 24
+
+# Long video with chunking to prevent OOM
+python cli_main.py --input long_video.mp4 --output upscaled.mp4 \
+    --frame_chunk_size 50 --mode tiny-long
+
+# Low VRAM mode (8GB GPUs)
+python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2 \
+    --vae_model LightVAE_W2.1 --tiled_vae --tiled_dit \
+    --frame_chunk_size 20 --resize_factor 0.5
+```
+
+### CLI Arguments Reference
+
+All arguments map 1:1 with ComfyUI node inputs. Run `python cli_main.py --help` for full details.
+
+#### Required Arguments
+
+| Argument | Description |
+| :--- | :--- |
+| `--input`, `-i` | Input video file path (e.g., `video.mp4`) |
+| `--output`, `-o` | Output video file path (e.g., `upscaled.mp4`) |
+
+#### Pipeline Initialization (from FlashVSRNodeInitPipe)
+
+| Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--model` | choice | `FlashVSR-v1.1` | Model version: `FlashVSR`, `FlashVSR-v1.1` |
+| `--mode` | choice | `tiny` | Operation mode: `tiny`, `tiny-long`, `full` |
+| `--vae_model` | choice | `Wan2.1` | VAE model: `Wan2.1`, `Wan2.2`, `LightVAE_W2.1`, `TAE_W2.2`, `LightTAE_HY1.5` |
+| `--force_offload` | flag | `True` | Force offload models to CPU after execution |
+| `--no_force_offload` | flag | - | Disable force offloading |
+| `--precision` | choice | `auto` | Precision: `fp16`, `bf16`, `auto` |
+| `--device` | string | `auto` | Device: `cuda:0`, `cuda:1`, `cpu`, `auto` |
+| `--attention_mode` | choice | `sparse_sage_attention` | Attention: `sparse_sage_attention`, `block_sparse_attention`, `flash_attention_2`, `sdpa` |
+
+#### Processing Parameters (from FlashVSRNodeAdv)
+
+| Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--scale` | int | `2` | Upscaling factor: `2` or `4` |
+| `--color_fix` | flag | `True` | Apply wavelet-based color correction |
+| `--no_color_fix` | flag | - | Disable color correction |
+| `--tiled_vae` | flag | `False` | Enable spatial tiling for VAE decoder |
+| `--tiled_dit` | flag | `False` | Enable spatial tiling for DiT |
+| `--tile_size` | int | `256` | Tile size for DiT processing (32-1024) |
+| `--tile_overlap` | int | `24` | Overlap pixels between tiles (8-512) |
+| `--unload_dit` | flag | `False` | Unload DiT before VAE decoding |
+| `--sparse_ratio` | float | `2.0` | Sparse attention control (1.5-2.0) |
+| `--kv_ratio` | float | `3.0` | Key/Value cache ratio (1.0-3.0) |
+| `--local_range` | int | `11` | Local attention window: `9` or `11` |
+| `--seed` | int | `0` | Random seed for reproducibility |
+| `--frame_chunk_size` | int | `0` | Process N frames at a time (0 = all) |
+| `--enable_debug` | flag | `False` | Enable verbose logging |
+| `--keep_models_on_cpu` | flag | `True` | Keep models in CPU RAM when idle |
+| `--no_keep_models_on_cpu` | flag | - | Keep models in VRAM |
+| `--resize_factor` | float | `1.0` | Resize input before processing (0.1-1.0) |
+
+#### Video I/O Parameters
+
+| Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--fps` | float | input FPS | Output video FPS |
+| `--codec` | string | `libx264` | Video codec: `libx264`, `libx265`, `h264_nvenc` |
+| `--crf` | int | `18` | Quality (0-51, lower = better) |
+| `--start_frame` | int | `0` | Start frame index (0-indexed) |
+| `--end_frame` | int | `-1` | End frame index (-1 = all frames) |
+| `--models_dir` | string | `./models` | Custom models directory path |
+
+---
+
 ## 🚀 Installation
 
 ### Step 1: Install the Node

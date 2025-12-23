@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ New Features
+
+- **Full-Featured CLI**: Added `cli_main.py` with exhaustive command-line argument mapping that mirrors all ComfyUI node inputs 1:1. Supports all parameters from FlashVSRNodeInitPipe, FlashVSRNodeAdv, and FlashVSRNode including:
+  - Pipeline initialization: `--model`, `--mode`, `--vae_model`, `--precision`, `--device`, `--attention_mode`
+  - Processing controls: `--scale`, `--color_fix`, `--tiled_vae`, `--tiled_dit`, `--tile_size`, `--tile_overlap`
+  - Advanced tuning: `--sparse_ratio`, `--kv_ratio`, `--local_range`, `--seed`, `--frame_chunk_size`
+  - VRAM optimization: `--unload_dit`, `--keep_models_on_cpu`, `--resize_factor`
+  - Video I/O: `--fps`, `--codec`, `--crf`, `--start_frame`, `--end_frame`, `--models_dir`
+
+### 📖 Documentation
+
+- Added comprehensive CLI arguments reference table to README.md with all parameter descriptions
+
+---
+
 ## [1.2.0] - 2025-12-23
 
 ### ✨ New Features
