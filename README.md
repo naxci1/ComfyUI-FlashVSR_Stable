@@ -9,6 +9,10 @@ Run FlashVSR on 8GB-24GB+ GPUs without artifacts. Features intelligent resource 
 
 ---
 
+Registry Link: https://registry.comfy.org/tr/publishers/naxci1/nodes/ComfyUI-FlashVSR_Stable
+
+---
+
 ## ✨ Key Features
 
 - **🎬 Video Super Resolution**: 2x or 4x upscaling using FlashVSR diffusion models
