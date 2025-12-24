@@ -9,7 +9,7 @@ Run FlashVSR on 8GB-24GB+ GPUs without artifacts. Features intelligent resource 
 
 ---
 
-Registry Link: https://registry.comfy.org/tr/publishers/naxci1/nodes/ComfyUI-FlashVSR_Stable
+Registry Link: https://registry.comfy.org/publishers/naxci1/nodes/ComfyUI-FlashVSR_Stable
 
 ---
 
