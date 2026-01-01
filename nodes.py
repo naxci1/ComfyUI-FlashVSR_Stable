@@ -964,6 +964,11 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
         
         log(f"Starting Tiled Processing: {len(tile_coords)} tiles", message_type='info', icon="🚀")
         
+        # Create progress bar wrapper for tiled pipeline processing
+        class cqdm_tile(cqdm):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs, enable_debug=enable_debug)
+        
         for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc="Processing Tiles", enable_debug=enable_debug)):
             tile_start = time.time()
             if enable_debug:
@@ -980,7 +985,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
 
             output_tile_gpu = pipe(
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
-                LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+                progress_bar_cmd=cqdm_tile, LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
                 color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload,
                 enable_debug_logging=enable_debug
