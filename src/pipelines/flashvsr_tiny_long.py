@@ -483,9 +483,22 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     out_H = H * 8
                     out_W = W * 8
                     
+                    # Calculate expected output temporal dimension
+                    # TCDecoder has 2 TGrow(stride=2) layers, so T is multiplied by 4
+                    # Trimming removes first `frames_to_trim` frames only when memory is uninitialized
+                    # Check if this is the first tile to determine trim behavior
+                    # Note: Index -8 checks a specific MemBlock in the decoder to determine if state exists
+                    sample_tile_key = (0, 0)
+                    if sample_tile_key not in vae_tile_states or vae_tile_states[sample_tile_key][-8] is None:
+                        # First decode - trimming will occur (frames_to_trim = 2**sum(decoder_time_upscale) - 1 = 3)
+                        T_out = T * 4 - self.TCDecoder.frames_to_trim
+                    else:
+                        # Subsequent decode - no trimming
+                        T_out = T * 4
+                    
                     # Accumulation buffers on CPU to prevent VRAM spikes
-                    cur_frames = torch.zeros((B, 3, T, out_H, out_W), dtype=cur_latents.dtype, device='cpu')
-                    weights = torch.zeros((B, 3, T, out_H, out_W), dtype=cur_latents.dtype, device='cpu')
+                    cur_frames = torch.zeros((B, 3, T_out, out_H, out_W), dtype=cur_latents.dtype, device='cpu')
+                    weights = torch.zeros((B, 3, T_out, out_H, out_W), dtype=cur_latents.dtype, device='cpu')
                     
                     for y in range(0, H, l_stride_h):
                         for x in range(0, W, l_stride_w):
