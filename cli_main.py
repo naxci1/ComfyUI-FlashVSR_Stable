@@ -516,11 +516,14 @@ def main():
         chunk_size=args.frame_chunk_size
     )
     
-    input_fps, total_frames_to_process = reader.get_info()
-    if args.end_frame > 0:
-        frames_count = args.end_frame - args.start_frame
+    input_fps, file_total_frames = reader.get_info()
+    
+    # Calculate actual frames to process based on reader's resolved range
+    total_frames_to_process = reader.end_frame - reader.start_frame
+    
+    if args.end_frame > 0 or args.start_frame > 0:
         print(f"Input: {args.input} ({input_fps:.2f} FPS)")
-        print(f"Processing frames: {args.start_frame} to {args.end_frame} (Total: {frames_count})")
+        print(f"Processing frames: {reader.start_frame} to {reader.end_frame} (Total: {total_frames_to_process})")
     else:
         print(f"Input: {args.input} ({input_fps:.2f} FPS, {total_frames_to_process} frames)")
         
