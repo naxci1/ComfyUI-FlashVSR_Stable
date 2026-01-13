@@ -285,124 +285,152 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
 # Video I/O utilities
 # =============================================================================
 
-def load_video_frames(video_path, start_frame=0, end_frame=-1):
+# =============================================================================
+# Video I/O utilities (Stream based)
+# =============================================================================
+
+class VideoReader:
     """
-    Load video frames from a file.
-    
-    Returns:
-        frames: torch.Tensor of shape (N, H, W, C) with values in [0, 1]
-        fps: float, original video FPS
+    Iterator that reads video frames in chunks to save memory.
     """
-    import torch
-    import numpy as np
-    
-    try:
+    def __init__(self, video_path, start_frame=0, end_frame=-1, chunk_size=0):
         import cv2
-    except ImportError:
-        raise ImportError("OpenCV is required for video loading. Install with: pip install opencv-python")
-
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Input video not found: {video_path}")
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    if end_frame < 0 or end_frame > total_frames:
-        end_frame = total_frames
-    
-    frames = []
-    frame_idx = 0
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        self.video_path = video_path
+        self.start_frame = start_frame
+        self.end_frame = end_frame
+        self.chunk_size = chunk_size
         
-        if frame_idx >= start_frame and frame_idx < end_frame:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Input video not found: {video_path}")
+
+        self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {video_path}")
+
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Adjust end_frame
+        if self.end_frame < 0 or self.end_frame > self.total_frames:
+            self.end_frame = self.total_frames
+            
+        if self.start_frame >= self.total_frames:
+            print(f"Warning: Start frame {self.start_frame} is beyond total frames {self.total_frames}.")
+            self.end_frame = self.start_frame # Nothing to process
+
+        self.current_frame = self.start_frame
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.current_frame >= self.end_frame:
+            self.cap.release()
+            raise StopIteration
+
+        import torch
+        import numpy as np
+        import cv2
+
+        frames = []
+        frames_to_read = self.chunk_size if self.chunk_size > 0 else (self.end_frame - self.current_frame)
+        
+        # Ensure we don't read past end_frame
+        frames_to_read = min(frames_to_read, self.end_frame - self.current_frame)
+        
+        if frames_to_read <= 0:
+            self.cap.release()
+            raise StopIteration
+
+        for _ in range(frames_to_read):
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            
             # Convert BGR to RGB
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             # Normalize to [0, 1]
             frame_normalized = frame_rgb.astype(np.float32) / 255.0
             frames.append(frame_normalized)
-        
-        frame_idx += 1
-        if frame_idx >= end_frame:
-            break
-    
-    cap.release()
-    
-    if len(frames) == 0:
-        raise RuntimeError(f"No frames loaded from video: {video_path}")
-    
-    # Stack frames into tensor: (N, H, W, C)
-    frames_tensor = torch.from_numpy(np.stack(frames, axis=0))
-    
-    print(f"Loaded {len(frames)} frames from {video_path} ({fps:.2f} FPS)")
-    print(f"Frame dimensions: {frames_tensor.shape[1]}x{frames_tensor.shape[2]}")
-    
-    return frames_tensor, fps
+            self.current_frame += 1
 
+        if not frames:
+            self.cap.release()
+            raise StopIteration
 
-def save_video_frames(frames_tensor, output_path, fps, codec='libx264', crf=18):
+        # Stack frames into tensor: (N, H, W, C)
+        frames_tensor = torch.from_numpy(np.stack(frames, axis=0))
+        return frames_tensor
+
+    def get_info(self):
+        return self.fps, self.total_frames
+
+class VideoWriter:
     """
-    Save video frames to a file.
-    
-    Args:
-        frames_tensor: torch.Tensor of shape (N, H, W, C) with values in [0, 1]
-        output_path: Output video file path
-        fps: Output FPS
-        codec: Video codec
-        crf: Constant Rate Factor
+    Incremental video writer.
     """
-    import torch
-    import numpy as np
-    
-    try:
+    def __init__(self, output_path, fps, width, height, codec='libx264', crf=18):
         import cv2
-    except ImportError:
-        raise ImportError("OpenCV is required for video saving. Install with: pip install opencv-python")
+        self.output_path = output_path
+        self.width = width
+        self.height = height
+        self.codec = codec
+        self.crf = crf
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        
+        # Determine codec fourcc
+        if codec in ['libx264', 'h264']:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v') # mp4v is safer for general compatibility without ffmpeg specifically
+        elif codec in ['libx265', 'hevc']:
+            fourcc = cv2.VideoWriter_fourcc(*'hvc1')
+        else:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            
+        self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        if not self.out.isOpened():
+             print("Warning: cv2.VideoWriter failed to open with default flags. Trying 'mp4v'.")
+             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+             self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+             if not self.out.isOpened():
+                raise RuntimeError(f"Failed to create output video: {output_path}")
 
-    # Convert tensor to numpy
-    if isinstance(frames_tensor, torch.Tensor):
-        frames_np = frames_tensor.cpu().numpy()
-    else:
-        frames_np = frames_tensor
-    
-    # Ensure values are in [0, 1] and convert to uint8
-    frames_np = np.clip(frames_np, 0.0, 1.0)
-    frames_np = (frames_np * 255).astype(np.uint8)
-    
-    n_frames, height, width, channels = frames_np.shape
-    
-    # Determine codec fourcc
-    if codec in ['libx264', 'h264']:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    elif codec in ['libx265', 'hevc']:
-        fourcc = cv2.VideoWriter_fourcc(*'hvc1')
-    else:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    
-    if not out.isOpened():
-        raise RuntimeError(f"Failed to create output video: {output_path}")
-    
-    for i in range(n_frames):
-        # Convert RGB to BGR for OpenCV
-        frame_bgr = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR)
-        out.write(frame_bgr)
-    
-    out.release()
-    
-    print(f"Saved {n_frames} frames to {output_path} ({fps:.2f} FPS)")
-    print(f"Output dimensions: {width}x{height}")
+    def write(self, frames_tensor):
+        import torch
+        import numpy as np
+        import cv2
+        
+        # Convert tensor to numpy
+        if isinstance(frames_tensor, torch.Tensor):
+            frames_np = frames_tensor.cpu().numpy()
+        else:
+            frames_np = frames_tensor
+        
+        # Ensure values are in [0, 1] and convert to uint8
+        frames_np = np.clip(frames_np, 0.0, 1.0)
+        frames_np = (frames_np * 255).astype(np.uint8)
+        
+        n_frames = frames_np.shape[0]
+        
+        for i in range(n_frames):
+            # Convert RGB to BGR for OpenCV
+            frame_bgr = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR)
+            self.out.write(frame_bgr)
+            
+    def release(self):
+        if self.out:
+            self.out.release()
+
+def format_time(seconds):
+    """
+    Format seconds into HH:MM:SS or MM:SS
+    """
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}"
 
 
 # =============================================================================
@@ -411,6 +439,11 @@ def save_video_frames(frames_tensor, output_path, fps, codec='libx264', crf=18):
 
 def main():
     args = parse_args()
+
+    # Safety check: ensure output file does not already exist
+    if os.path.exists(args.output):
+        print(f"Error: Output file '{args.output}' already exists. Aborting to prevent overwrite.", file=sys.stderr)
+        sys.exit(1)
     
     # Handle boolean flag pairs
     force_offload = args.force_offload and not args.no_force_offload
@@ -431,7 +464,6 @@ def main():
     # ==========================================================================
     
     # Mock ComfyUI modules for standalone CLI operation
-    import sys
     from unittest.mock import MagicMock
     
     # Create mock folder_paths module
@@ -474,15 +506,27 @@ def main():
     from src.models import wan_video_dit
     
     # ==========================================================================
-    # Load input video
+    # Load input video (Lazily)
     # ==========================================================================
-    print("\nLoading input video...")
-    frames, input_fps = load_video_frames(
+    print("\nInitializing Video Reader...")
+    reader = VideoReader(
         args.input, 
         start_frame=args.start_frame, 
-        end_frame=args.end_frame
+        end_frame=args.end_frame,
+        chunk_size=args.frame_chunk_size
     )
     
+    input_fps, file_total_frames = reader.get_info()
+    
+    # Calculate actual frames to process based on reader's resolved range
+    total_frames_to_process = reader.end_frame - reader.start_frame
+    
+    if args.end_frame > 0 or args.start_frame > 0:
+        print(f"Input: {args.input} ({input_fps:.2f} FPS)")
+        print(f"Processing frames: {reader.start_frame} to {reader.end_frame} (Total: {total_frames_to_process})")
+    else:
+        print(f"Input: {args.input} ({input_fps:.2f} FPS, {total_frames_to_process} frames)")
+        
     # Use output FPS if specified, otherwise use input FPS
     output_fps = args.fps if args.fps is not None else input_fps
     
@@ -521,53 +565,114 @@ def main():
     )
     
     # ==========================================================================
-    # Process video with FlashVSR
+    # Process video with FlashVSR (Chunk by Chunk)
     # ==========================================================================
     print("\nProcessing video with FlashVSR...")
     
-    output_frames = flashvsr(
-        pipe=pipe,
-        frames=frames,
-        scale=args.scale,
-        color_fix=color_fix,
-        tiled_vae=args.tiled_vae,
-        tiled_dit=args.tiled_dit,
-        tile_size=args.tile_size,
-        tile_overlap=args.tile_overlap,
-        unload_dit=args.unload_dit,
-        sparse_ratio=args.sparse_ratio,
-        kv_ratio=args.kv_ratio,
-        local_range=args.local_range,
-        seed=args.seed,
-        force_offload=keep_models_on_cpu,  # flashvsr() uses force_offload param for CPU offloading
-        enable_debug=args.enable_debug,
-        chunk_size=args.frame_chunk_size,
-        resize_factor=args.resize_factor,
-        mode=args.mode
-    )
+    writer = None
+    total_processed = 0
+    start_time_glob = 0
     
-    # ==========================================================================
-    # Save output video
-    # ==========================================================================
-    print("\nSaving output video...")
-    save_video_frames(
-        frames_tensor=output_frames,
-        output_path=args.output,
-        fps=output_fps,
-        codec=args.codec,
-        crf=args.crf
-    )
+    try:
+        import time
+        start_time_glob = time.time()
+        
+        for chunk_idx, frames in enumerate(reader):
+            # Calculate progress metrics
+            elapsed = time.time() - start_time_glob
+            
+            # Speed (fps) - avoid division by zero
+            if total_processed > 0 and elapsed > 0:
+                speed_fps = total_processed / elapsed
+                remaining_frames = total_frames_to_process - total_processed
+                eta_seconds = remaining_frames / speed_fps
+            else:
+                speed_fps = 0.0
+                eta_seconds = 0
+            
+            formatted_elapsed = format_time(elapsed)
+            formatted_eta = format_time(eta_seconds)
+            
+            # Print status for the *current state* (before processing this chunk)
+            # format: Progress:   8.34% | Processed: 6464/77514 | Elapsed: 1:34:31 | ETA: 0:12:10 | Speed: 1.25 fps
+            progress_pct = (total_processed / total_frames_to_process) * 100 if total_frames_to_process > 0 else 0
+            print(f"Progress: {progress_pct:6.2f}% | Processed: {total_processed}/{total_frames_to_process} | "
+                  f"Elapsed: {formatted_elapsed} | ETA: {formatted_eta} | Speed: {speed_fps:.2f} fps")
+            
+            # Process the chunk
+            # Note: We pass chunk_size=0 to flashvsr because we are feeding it an explicit chunk
+            # that we want processed fully right now.
+            output_frames = flashvsr(
+                pipe=pipe,
+                frames=frames,
+                scale=args.scale,
+                color_fix=color_fix,
+                tiled_vae=args.tiled_vae,
+                tiled_dit=args.tiled_dit,
+                tile_size=args.tile_size,
+                tile_overlap=args.tile_overlap,
+                unload_dit=args.unload_dit,
+                sparse_ratio=args.sparse_ratio,
+                kv_ratio=args.kv_ratio,
+                local_range=args.local_range,
+                seed=args.seed,
+                force_offload=keep_models_on_cpu,  # flashvsr() uses force_offload param for CPU offloading
+                enable_debug=args.enable_debug,
+                chunk_size=0, # Already chunked
+                resize_factor=args.resize_factor,
+                mode=args.mode
+            )
+            
+            # Initialize Writer on first chunk
+            if writer is None:
+                h, w = output_frames.shape[1], output_frames.shape[2]
+                print(f"Output dimensions: {w}x{h}")
+                print(f"Saving output video to: {args.output}")
+                writer = VideoWriter(
+                    output_path=args.output,
+                    fps=output_fps,
+                    width=w,
+                    height=h,
+                    codec=args.codec,
+                    crf=args.crf
+                )
+            
+            # Write frames
+            writer.write(output_frames)
+            total_processed += frames.shape[0]
+            
+            # Cleanup
+            del frames, output_frames
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+    except StopIteration:
+        pass
+    except Exception as e:
+        print(f"\nError during processing: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if writer:
+            writer.release()
     
     # ==========================================================================
     # Cleanup
     # ==========================================================================
-    del pipe, frames, output_frames
+    del pipe
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
+    end_time_glob = time.time()
+    total_duration = end_time_glob - start_time_glob
+    avg_fps = total_processed / total_duration if total_duration > 0 else 0
+    
     print("\n" + "=" * 60)
     print("FlashVSR processing complete!")
+    print(f"Total Frames Processed: {total_processed}/{total_frames_to_process}")
+    print(f"Total Time: {format_time(total_duration)} ({avg_fps:.2f} FPS)")
     print("=" * 60)
 
 
