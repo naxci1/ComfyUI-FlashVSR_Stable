@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.2.8] - 2026-01-20
+
+### 🐛 Bug Fixes
+
+- ** FlashVSR nodes return half-precision tensors on CUDA, breaking downstream nodes that expect float32 on CPU. This causes type mismatch errors in FILM interpolator and other processing nodes.
+- ** The tiled processing path creates final_output_canvas with dtype=torch.float16, causing accumulated results to remain in half precision despite tensor2video() converting to float32. Output tensors vary between fp16/bf16/CUDA depending on processing path.
+
 ## [1.2.7] - 2025-12-23
 
 ### ✨ New Features
