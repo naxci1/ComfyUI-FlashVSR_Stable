@@ -59,17 +59,28 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     # ==========================================================================
     # Required arguments
     # ==========================================================================
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
         '--input', '-i',
         type=str,
-        required=True,
         help='Input video file path (e.g., video.mp4)'
     )
-    parser.add_argument(
+    input_group.add_argument(
+        '--input_frames', '-if',
+        type=str,
+        help='Input folder containing extracted frames (e.g., frames/)'
+    )
+    
+    output_group = parser.add_mutually_exclusive_group(required=True)
+    output_group.add_argument(
         '--output', '-o',
         type=str,
-        required=True,
         help='Output video file path (e.g., upscaled.mp4)'
+    )
+    output_group.add_argument(
+        '--output_frames', '-of',
+        type=str,
+        help='Output folder for upscaled frames (e.g., upscaled_frames/)'
     )
 
     # ==========================================================================
@@ -256,6 +267,12 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         help='Constant Rate Factor for quality (0-51, lower = better quality). (default: 18)'
     )
     parser.add_argument(
+        '--quality',
+        type=int,
+        default=95,
+        help='Output quality for frame images (1-100, higher = better quality). (default: 95)'
+    )
+    parser.add_argument(
         '--start_frame',
         type=int,
         default=0,
@@ -388,7 +405,7 @@ class VideoWriter:
             fourcc = cv2.VideoWriter_fourcc(*'hvc1')
         else:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            
+         
         self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
         if not self.out.isOpened():
@@ -396,7 +413,7 @@ class VideoWriter:
              fourcc = cv2.VideoWriter_fourcc(*'mp4v')
              self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
              if not self.out.isOpened():
-                raise RuntimeError(f"Failed to create output video: {output_path}")
+                 raise RuntimeError(f"Failed to create output video: {output_path}")
 
     def write(self, frames_tensor):
         import torch
@@ -419,10 +436,176 @@ class VideoWriter:
             # Convert RGB to BGR for OpenCV
             frame_bgr = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR)
             self.out.write(frame_bgr)
-            
+             
     def release(self):
         if self.out:
             self.out.release()
+
+class FrameReader:
+    """
+    Iterator that reads image frames from a folder.
+    """
+    def __init__(self, frames_folder, start_frame=0, end_frame=-1, chunk_size=0):
+        import numpy as np
+        from PIL import Image
+        import glob
+        
+        self.frames_folder = frames_folder
+        self.start_frame = start_frame
+        self.end_frame = end_frame
+        self.chunk_size = chunk_size
+        self.current_frame_idx = 0
+        self.current_frame = 0
+        
+        if not os.path.exists(frames_folder):
+            raise FileNotFoundError(f"Input frames folder not found: {frames_folder}")
+        
+        # Get all image files and sort them
+        supported_extensions = ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tiff', '*.webp']
+        frame_files = []
+        for ext in supported_extensions:
+            frame_files.extend(glob.glob(os.path.join(frames_folder, ext)))
+        
+        if not frame_files:
+            raise RuntimeError(f"No image files found in folder: {frames_folder}")
+        
+        # Sort files by name to ensure consistent ordering
+        frame_files.sort()
+        self.frame_files = frame_files
+        self.total_frames = len(frame_files)
+        
+        # Adjust end_frame
+        if self.end_frame < 0 or self.end_frame > self.total_frames:
+            self.end_frame = self.total_frames
+            
+        if self.start_frame >= self.total_frames:
+            print(f"Warning: Start frame {self.start_frame} is beyond total frames {self.total_frames}.")
+            self.end_frame = self.start_frame # Nothing to process
+        
+        self.current_frame_idx = self.start_frame
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.current_frame_idx >= self.end_frame:
+            raise StopIteration
+        
+        import torch
+        import numpy as np
+        from PIL import Image
+        
+        frames = []
+        frames_to_read = self.chunk_size if self.chunk_size > 0 else (self.end_frame - self.current_frame_idx)
+        
+        # Ensure we don't read past end_frame
+        frames_to_read = min(frames_to_read, self.end_frame - self.current_frame_idx)
+        
+        if frames_to_read <= 0:
+            raise StopIteration
+        
+        for _ in range(frames_to_read):
+            if self.current_frame_idx >= len(self.frame_files):
+                break
+                
+            frame_path = self.frame_files[self.current_frame_idx]
+            
+            # Read image using PIL
+            img = Image.open(frame_path)
+            
+            # Convert to RGB if needed
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Convert to numpy array and normalize to [0, 1]
+            frame_np = np.array(img).astype(np.float32) / 255.0
+            frames.append(frame_np)
+            self.current_frame_idx += 1
+        
+        if not frames:
+            raise StopIteration
+        
+        # Stack frames into tensor: (N, H, W, C)
+        frames_tensor = torch.from_numpy(np.stack(frames, axis=0))
+        return frames_tensor
+
+    def get_info(self):
+        # For frame processing, we don't have FPS information
+        # Return a dummy FPS value and total frames
+        return 30.0, self.total_frames
+
+class FrameWriter:
+    """
+    Writes upscaled frames to a folder, preserving original names and formats.
+    """
+    def __init__(self, output_folder, quality=95):
+        self.output_folder = output_folder
+        self.quality = quality
+        
+        # Ensure output directory exists
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # Store frame filenames for later use
+        self.frame_filenames = []
+
+    def set_frame_filenames(self, frame_filenames):
+        """Set the original frame filenames to preserve naming."""
+        self.frame_filenames = frame_filenames
+
+    def write(self, frames_tensor, frame_indices=None):
+        """
+        Write frames to output folder.
+        
+        Args:
+            frames_tensor: Tensor of shape (N, H, W, C) containing frames to write
+            frame_indices: List of indices corresponding to original frame positions
+        """
+        import torch
+        import numpy as np
+        from PIL import Image
+        
+        # Convert tensor to numpy
+        if isinstance(frames_tensor, torch.Tensor):
+            frames_np = frames_tensor.cpu().numpy()
+        else:
+            frames_np = frames_tensor
+        
+        # Ensure values are in [0, 1] and convert to uint8
+        frames_np = np.clip(frames_np, 0.0, 1.0)
+        frames_np = (frames_np * 255).astype(np.uint8)
+        
+        n_frames = frames_np.shape[0]
+        
+        for i in range(n_frames):
+            # Convert to PIL Image
+            frame_pil = Image.fromarray(frames_np[i])
+            
+            # Determine output filename
+            if frame_indices is not None and i < len(frame_indices):
+                # Use original filename if available
+                original_idx = frame_indices[i]
+                if original_idx < len(self.frame_filenames):
+                    original_path = self.frame_filenames[original_idx]
+                    filename = os.path.basename(original_path)
+                    output_path = os.path.join(self.output_folder, filename)
+                else:
+                    # Fallback naming
+                    output_path = os.path.join(self.output_folder, f"frame_{original_idx:06d}.png")
+            else:
+                # Use sequential naming
+                output_path = os.path.join(self.output_folder, f"frame_{self.current_frame:06d}.png")
+                self.current_frame += 1
+            
+            # Save image with appropriate quality
+            if output_path.lower().endswith('.jpg') or output_path.lower().endswith('.jpeg'):
+                frame_pil.save(output_path, quality=self.quality, subsampling=0)
+            else:
+                # For PNG and other formats, use default settings
+                frame_pil.save(output_path)
+
+    def release(self):
+        # No resources to release for frame writer
+        pass
 
 def format_time(seconds):
     """
@@ -440,11 +623,23 @@ def format_time(seconds):
 def main():
     args = parse_args()
 
-    # Safety check: ensure output file does not already exist
-    if os.path.exists(args.output):
-        print(f"Error: Output file '{args.output}' already exists. Aborting to prevent overwrite.", file=sys.stderr)
-        sys.exit(1)
+    # Determine if we're processing frames or video
+    is_frame_processing = hasattr(args, 'input_frames') and args.input_frames is not None
     
+    # Safety check for output
+    if not is_frame_processing:
+        # Video processing - check if output file exists
+        if os.path.exists(args.output):
+            print(f"Error: Output file '{args.output}' already exists. Aborting to prevent overwrite.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Frame processing - check if output folder exists and is not empty
+        if os.path.exists(args.output_frames):
+            # Check if folder is empty
+            if os.listdir(args.output_frames):
+                print(f"Warning: Output folder '{args.output_frames}' already exists and is not empty.", file=sys.stderr)
+                print("Existing files may be overwritten.", file=sys.stderr)
+
     # Handle boolean flag pairs
     force_offload = args.force_offload and not args.no_force_offload
     color_fix = args.color_fix and not args.no_color_fix
@@ -453,8 +648,15 @@ def main():
     print("=" * 60)
     print("FlashVSR CLI - Video Super Resolution")
     print("=" * 60)
-    print(f"Input: {args.input}")
-    print(f"Output: {args.output}")
+    
+    if is_frame_processing:
+        print(f"Input Frames: {args.input_frames}")
+        print(f"Output Frames: {args.output_frames}")
+        print(f"Quality: {args.quality}")
+    else:
+        print(f"Input: {args.input}")
+        print(f"Output: {args.output}")
+    
     print(f"Model: {args.model}, Mode: {args.mode}")
     print(f"VAE: {args.vae_model}, Scale: {args.scale}x")
     print("=" * 60)
@@ -506,29 +708,51 @@ def main():
     from src.models import wan_video_dit
     
     # ==========================================================================
-    # Load input video (Lazily)
+    # Load input (Video or Frames)
     # ==========================================================================
-    print("\nInitializing Video Reader...")
-    reader = VideoReader(
-        args.input, 
-        start_frame=args.start_frame, 
-        end_frame=args.end_frame,
-        chunk_size=args.frame_chunk_size
-    )
-    
-    input_fps, file_total_frames = reader.get_info()
-    
-    # Calculate actual frames to process based on reader's resolved range
-    total_frames_to_process = reader.end_frame - reader.start_frame
-    
-    if args.end_frame > 0 or args.start_frame > 0:
-        print(f"Input: {args.input} ({input_fps:.2f} FPS)")
-        print(f"Processing frames: {reader.start_frame} to {reader.end_frame} (Total: {total_frames_to_process})")
-    else:
-        print(f"Input: {args.input} ({input_fps:.2f} FPS, {total_frames_to_process} frames)")
+    if is_frame_processing:
+        print("\nInitializing Frame Reader...")
+        reader = FrameReader(
+            args.input_frames,
+            start_frame=args.start_frame,
+            end_frame=args.end_frame,
+            chunk_size=args.frame_chunk_size
+        )
         
-    # Use output FPS if specified, otherwise use input FPS
-    output_fps = args.fps if args.fps is not None else input_fps
+        # For frame processing, we use a dummy FPS value
+        input_fps = 30.0
+        file_total_frames = reader.total_frames
+        
+        # Calculate actual frames to process based on reader's resolved range
+        total_frames_to_process = reader.end_frame - reader.start_frame
+        
+        if args.end_frame > 0 or args.start_frame > 0:
+            print(f"Input: {args.input_frames} (folder)")
+            print(f"Processing frames: {reader.start_frame} to {reader.end_frame} (Total: {total_frames_to_process})")
+        else:
+            print(f"Input: {args.input_frames} (folder, {total_frames_to_process} frames)")
+    else:
+        print("\nInitializing Video Reader...")
+        reader = VideoReader(
+            args.input,
+            start_frame=args.start_frame,
+            end_frame=args.end_frame,
+            chunk_size=args.frame_chunk_size
+        )
+
+        input_fps, file_total_frames = reader.get_info()
+
+        # Calculate actual frames to process based on reader's resolved range
+        total_frames_to_process = reader.end_frame - reader.start_frame
+
+        if args.end_frame > 0 or args.start_frame > 0:
+            print(f"Input: {args.input} ({input_fps:.2f} FPS)")
+            print(f"Processing frames: {reader.start_frame} to {reader.end_frame} (Total: {total_frames_to_process})")
+        else:
+            print(f"Input: {args.input} ({input_fps:.2f} FPS, {total_frames_to_process} frames)")
+        
+        # Use output FPS if specified, otherwise use input FPS
+        output_fps = args.fps if args.fps is not None else input_fps
     
     # ==========================================================================
     # Initialize pipeline
@@ -565,17 +789,20 @@ def main():
     )
     
     # ==========================================================================
-    # Process video with FlashVSR (Chunk by Chunk)
+    # Process with FlashVSR (Chunk by Chunk)
     # ==========================================================================
-    print("\nProcessing video with FlashVSR...")
-    
+    print("\nProcessing with FlashVSR...")
+
     writer = None
     total_processed = 0
     start_time_glob = 0
-    
+
     try:
         import time
         start_time_glob = time.time()
+        
+        # For frame processing, we need to track frame indices for naming
+        frame_indices = []
         
         for chunk_idx, frames in enumerate(reader):
             # Calculate progress metrics
@@ -627,18 +854,37 @@ def main():
             if writer is None:
                 h, w = output_frames.shape[1], output_frames.shape[2]
                 print(f"Output dimensions: {w}x{h}")
-                print(f"Saving output video to: {args.output}")
-                writer = VideoWriter(
-                    output_path=args.output,
-                    fps=output_fps,
-                    width=w,
-                    height=h,
-                    codec=args.codec,
-                    crf=args.crf
-                )
+                
+                if is_frame_processing:
+                    print(f"Saving output frames to: {args.output_frames}")
+                    writer = FrameWriter(
+                        output_folder=args.output_frames,
+                        quality=args.quality
+                    )
+                    # Set frame filenames for frame writer
+                    if hasattr(reader, 'frame_files'):
+                        writer.set_frame_filenames(reader.frame_files)
+                else:
+                    print(f"Saving output video to: {args.output}")
+                    writer = VideoWriter(
+                        output_path=args.output,
+                        fps=output_fps,
+                        width=w,
+                        height=h,
+                        codec=args.codec,
+                        crf=args.crf
+                    )
             
             # Write frames
-            writer.write(output_frames)
+            if is_frame_processing:
+                # For frame processing, track which original frames these correspond to
+                start_idx = total_processed
+                end_idx = total_processed + frames.shape[0]
+                frame_indices = list(range(start_idx, end_idx))
+                writer.write(output_frames, frame_indices)
+            else:
+                writer.write(output_frames)
+            
             total_processed += frames.shape[0]
             
             # Cleanup
@@ -670,7 +916,10 @@ def main():
     avg_fps = total_processed / total_duration if total_duration > 0 else 0
     
     print("\n" + "=" * 60)
-    print("FlashVSR processing complete!")
+    if is_frame_processing:
+        print("FlashVSR frame processing complete!")
+    else:
+        print("FlashVSR video processing complete!")
     print(f"Total Frames Processed: {total_processed}/{total_frames_to_process}")
     print(f"Total Time: {format_time(total_duration)} ({avg_fps:.2f} FPS)")
     print("=" * 60)

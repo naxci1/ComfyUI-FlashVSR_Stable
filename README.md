@@ -219,6 +219,35 @@ python cli_main.py --input video.mp4 --output upscaled.mp4 --scale 2 \
     --frame_chunk_size 20 --resize_factor 0.5
 ```
 
+### 🖼️ Frame Processing (NEW)
+
+Process extracted frames instead of video files - perfect for batch processing or when working with individual frames:
+
+```bash
+# Basic frame processing (2x upscale, max quality)
+python cli_main.py --input_frames frames/ --output_frames upscaled_frames/ --scale 2
+
+# Frame processing with custom quality and tiling
+python cli_main.py --input_frames frames/ --output_frames upscaled_frames/ \
+    --scale 4 --quality 90 --tiled_vae --tiled_dit
+
+# Process specific frame range
+python cli_main.py --input_frames frames/ --output_frames result/ \
+    --scale 2 --start_frame 10 --end_frame 50 --quality 85
+
+# Process JPEG frames with balanced quality
+python cli_main.py --input_frames jpeg_frames/ --output_frames upscaled_jpeg/ \
+    --scale 2 --quality 80 --mode tiny
+```
+
+**Frame Processing Features:**
+- ✅ **Multi-format support**: PNG, JPG, JPEG, BMP, TIFF, WEBP
+- ✅ **Format preservation**: Output format matches input format
+- ✅ **Quality control**: Configurable JPEG quality (1-100, default: 95)
+- ✅ **Name preservation**: Original frame names are maintained
+- ✅ **Batch processing**: Process hundreds of frames efficiently
+- ✅ **Memory efficient**: Same chunking and tiling options as video processing
+
 ### CLI Arguments Reference
 
 All arguments map 1:1 with ComfyUI node inputs. Run `python cli_main.py --help` for full details.
@@ -229,6 +258,10 @@ All arguments map 1:1 with ComfyUI node inputs. Run `python cli_main.py --help` 
 | :--- | :--- |
 | `--input`, `-i` | Input video file path (e.g., `video.mp4`) |
 | `--output`, `-o` | Output video file path (e.g., `upscaled.mp4`) |
+| `--input_frames`, `-if` | Input folder containing extracted frames (e.g., `frames/`) |
+| `--output_frames`, `-of` | Output folder for upscaled frames (e.g., `upscaled_frames/`) |
+
+> 📝 **Note**: Use either `--input`/`--output` for video files **OR** `--input_frames`/`--output_frames` for frame processing. These are mutually exclusive options.
 
 #### Pipeline Initialization (from FlashVSRNodeInitPipe)
 
@@ -272,6 +305,7 @@ All arguments map 1:1 with ComfyUI node inputs. Run `python cli_main.py --help` 
 | `--fps` | float | input FPS | Output video FPS |
 | `--codec` | string | `libx264` | Video codec: `libx264`, `libx265`, `h264_nvenc` |
 | `--crf` | int | `18` | Quality (0-51, lower = better) |
+| `--quality` | int | `95` | **Frame output quality** (1-100, higher = better, for frame processing) |
 | `--start_frame` | int | `0` | Start frame index (0-indexed) |
 | `--end_frame` | int | `-1` | End frame index (-1 = all frames) |
 | `--models_dir` | string | `./models` | Custom models directory path |
@@ -325,6 +359,14 @@ ComfyUI/models/FlashVSR/
 ## 🏷️ Recent Changes
 
 See [CHANGELOG.md](CHANGELOG.md) for full version history.
+
+### v1.2.8 (2026-01-21) - **NEW RELEASE**
+- 🖼️ **Frame Processing Support**: Process extracted frames instead of video files
+- 📁 **Multi-format Support**: PNG, JPG, JPEG, BMP, TIFF, WEBP input/output
+- 🎛️ **Quality Control**: Configurable output quality (1-100) for frame processing
+- 🔄 **Format Preservation**: Output format matches input format automatically
+- 📝 **Name Preservation**: Original frame names maintained in output
+- 🚀 **Batch Processing**: Efficient processing of hundreds of frames
 
 ### v1.2.7 (2025-12-23)
 - 🚀 Pre-Flight Resource Calculator with settings recommendations
