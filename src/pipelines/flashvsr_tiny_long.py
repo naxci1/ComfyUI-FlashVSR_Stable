@@ -333,8 +333,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
     ):
         # FIX: Enable CPU offload based on force_offload parameter
         # This allows users with high VRAM to keep models in VRAM for better performance
-        if force_offload != self.cpu_offload:
-            self.enable_cpu_offload() if force_offload else self.disable_cpu_offload()
+        self.enable_cpu_offload() if force_offload else self.disable_cpu_offload()
         
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
