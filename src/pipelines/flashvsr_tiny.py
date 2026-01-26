@@ -204,7 +204,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                 computation_device=self.device,
             ),
         )
-        # FIX: Don't enable CPU offload by default - let user control it via force_offload parameter
+        self.enable_cpu_offload()
 
     def fetch_models(self, model_manager: ModelManager):
         self.dit = model_manager.fetch_model("wan_video_dit")
@@ -331,10 +331,6 @@ class FlashVSRTinyPipeline(BasePipeline):
         force_offload = False,
         enable_debug_logging = False,
     ):
-        # FIX: Enable CPU offload based on force_offload parameter
-        # This allows users with high VRAM to keep models in VRAM for better performance
-        self.enable_cpu_offload() if force_offload else self.disable_cpu_offload()
-        
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
 

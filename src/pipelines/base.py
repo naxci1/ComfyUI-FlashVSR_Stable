@@ -90,10 +90,6 @@ class BasePipeline(torch.nn.Module):
     def enable_cpu_offload(self):
         self.cpu_offload = True
 
-    def disable_cpu_offload(self):
-        """Disable CPU offload and ensure models stay on device"""
-        self.cpu_offload = False
-
 
     def load_models_to_device(self, loadmodel_names=[]):
         # only load models to device if cpu_offload is enabled

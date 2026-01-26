@@ -1483,21 +1483,13 @@ class FlashVSRNodeAdv:
     
     def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu, resize_factor):
         # FIX 10: Extract mode from pipe tuple for unified processing
-        # FIX: Use keep_models_on_cpu parameter to control offloading behavior
         # Pipe tuple structure: (pipeline_object, force_offload, mode)
         # Backwards compatible with older 2-element tuples (pipeline, force_offload)
         if len(pipe) >= 3:
-            _pipe, pipe_force_offload, mode = pipe
+            _pipe, _, mode = pipe
         else:
             _pipe = pipe[0]
             mode = "full"  # Default fallback for backwards compatibility
-            pipe_force_offload = True  # Old default behavior
-        
-        # Use keep_models_on_cpu parameter (node-level setting takes precedence)
-        # This allows users to override the init pipe setting per execution
-        # Note: keep_models_on_cpu and force_offload are semantically equivalent:
-        #  - keep_models_on_cpu=True means offload to CPU (force_offload=True)
-        #  - keep_models_on_cpu=False means keep in VRAM (force_offload=False)
         output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
         return(output.cpu().float(),)
 
