@@ -30,14 +30,18 @@ class FlashVSR_GGUF_Loader:
     @classmethod
     def INPUT_TYPES(cls):
         """Define input parameters for the ComfyUI node."""
-        # Get list of GGUF files from checkpoints folder
+        # FlashVSR model options
+        model_options = ["FlashVSR", "FlashVSR-v1.1"]
+        
+        # Get list of GGUF files from FlashVSR model directories
         gguf_files = []
         seen_files = set()
         try:
-            checkpoints_dir = folder_paths.get_folder_paths("checkpoints")
-            for checkpoint_dir in checkpoints_dir:
-                if os.path.exists(checkpoint_dir):
-                    for file in os.listdir(checkpoint_dir):
+            # Look in both FlashVSR and FlashVSR-v1.1 directories
+            for model_name in model_options:
+                model_path = os.path.join(folder_paths.models_dir, model_name)
+                if os.path.exists(model_path):
+                    for file in os.listdir(model_path):
                         if file.endswith(".gguf") and file not in seen_files:
                             gguf_files.append(file)
                             seen_files.add(file)
@@ -49,6 +53,9 @@ class FlashVSR_GGUF_Loader:
         
         return {
             "required": {
+                "model_name": (model_options, {
+                    "default": "FlashVSR-v1.1"
+                }),
                 "gguf_file": (gguf_files, {
                     "default": gguf_files[0] if gguf_files else "No GGUF files found"
                 }),
@@ -64,11 +71,12 @@ class FlashVSR_GGUF_Loader:
     CATEGORY = "FlashVSR"
     DESCRIPTION = "Load FlashVSR models from GGUF format with automatic 5D tensor reshaping"
     
-    def load_gguf_model(self, gguf_file, torch_dtype="auto"):
+    def load_gguf_model(self, model_name, gguf_file, torch_dtype="auto"):
         """
         Load a GGUF model file and create a ModelManager with the loaded models.
         
         Args:
+            model_name: FlashVSR model directory name (FlashVSR or FlashVSR-v1.1)
             gguf_file: Name of the GGUF file to load
             torch_dtype: Target dtype for tensors (auto, float32, float16, bfloat16)
             
@@ -76,26 +84,33 @@ class FlashVSR_GGUF_Loader:
             Tuple containing the ModelManager with loaded models
         """
         print(f"\n{'='*60}")
-        print(f"FlashVSR GGUF Loader")
+        print(f"🚀 FlashVSR GGUF Engine Active: Loading {gguf_file}")
         print(f"{'='*60}")
         
-        # Find the full path to the GGUF file
-        file_path = None
-        checkpoints_dirs = folder_paths.get_folder_paths("checkpoints")
+        # Construct path to GGUF file in FlashVSR model directory
+        model_path = os.path.join(folder_paths.models_dir, model_name)
+        file_path = os.path.join(model_path, gguf_file)
         
-        for checkpoint_dir in checkpoints_dirs:
-            potential_path = os.path.join(checkpoint_dir, gguf_file)
-            if os.path.exists(potential_path):
-                file_path = potential_path
-                break
+        # Check if file exists
+        if not os.path.exists(file_path):
+            # Fall back to checking other model directories
+            alternate_models = ["FlashVSR", "FlashVSR-v1.1"]
+            for alt_model in alternate_models:
+                if alt_model != model_name:
+                    alt_path = os.path.join(folder_paths.models_dir, alt_model, gguf_file)
+                    if os.path.exists(alt_path):
+                        file_path = alt_path
+                        print(f"⚠️ Found GGUF file in {alt_model} instead of {model_name}")
+                        break
+            else:
+                raise FileNotFoundError(
+                    f"GGUF file not found: {gguf_file}\n"
+                    f"Expected location: {file_path}\n"
+                    f"Please place GGUF files in: {model_path}"
+                )
         
-        if file_path is None:
-            raise FileNotFoundError(
-                f"GGUF file not found: {gguf_file}\n"
-                f"Searched in: {checkpoints_dirs}"
-            )
-        
-        print(f"Loading GGUF file: {file_path}")
+        print(f"📂 Model directory: {model_path}")
+        print(f"📄 Loading GGUF file: {file_path}")
         
         # Determine torch dtype
         dtype_map = {
