@@ -689,13 +689,15 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
+def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1", model_file=None):
     """
     Initialize FlashVSR pipeline with specified model and VAE type.
     
     =============================================================================
-    FIX 2 & 7: STRICT VAE file path mapping with EXPLICIT class instantiation
+    UPDATED: Dynamic Model File Loading with .gguf and .safetensors support
     =============================================================================
+    - model_file: Specific model file to load (optional, defaults to standard file)
+    - Supports both .gguf (with 5D tensor reshaping) and .safetensors files
     - vae_model: Unified VAE selection from dropdown (5 options)
     - Each VAE selection loads a DISTINCT file (no file reuse)
     - EXPLICIT class instantiation based on selection - NO guessing from state_dict
@@ -711,9 +713,21 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
     model_path = os.path.join(folder_paths.models_dir, model)
     if not os.path.exists(model_path):
         raise RuntimeError(f'Model directory does not exist!\nPlease save all weights to "{model_path}"')
-    ckpt_path = os.path.join(model_path, "diffusion_pytorch_model_streaming_dmd.safetensors")
+    
+    # ==========================================================================
+    # UPDATED: Use selected model file or fall back to default
+    # ==========================================================================
+    if model_file is None:
+        model_file = "diffusion_pytorch_model_streaming_dmd.safetensors"
+    
+    ckpt_path = os.path.join(model_path, model_file)
     if not os.path.exists(ckpt_path):
-        raise RuntimeError(f'"diffusion_pytorch_model_streaming_dmd.safetensors" does not exist!\nPlease save it to "{model_path}"')
+        raise RuntimeError(f'Selected model file does not exist: "{ckpt_path}"\nPlease ensure the file is in the model directory.')
+    
+    # Detect file type and log
+    is_gguf = ckpt_path.endswith(".gguf")
+    log(f"🚀 Loading Model File: {model_file} ({'GGUF with 5D reshaping' if is_gguf else 'SafeTensors'})", 
+        message_type='info', icon="📄")
     
     # ==========================================================================
     # FIX 2 & 7: VAE Model Loading - EXPLICIT mapping (no guessing!)
@@ -836,7 +850,7 @@ def init_pipeline(model, mode, device, dtype, vae_model="Wan2.1"):
         vae_info += f" ({type(pipe.vae).__name__})"
     
     log(f"Pipeline Initialized: Mode={mode}, Device={device}, Dtype={dtype}, Attention={wan_video_dit.ATTENTION_MODE}", message_type='info', icon="🔧")
-    log(f"Model: {model}, {vae_info}", message_type='info', icon="📦")
+    log(f"Model: {model} ({model_file}), {vae_info}", message_type='info', icon="📦")
 
     return pipe
 
@@ -1295,16 +1309,44 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
 class FlashVSRNodeInitPipe:
     """
     =============================================================================
-    FIX 1: Unified VAE Selection - Merged vae_type and alt_vae into vae_model
+    REWRITTEN: Dynamic File Selector for .safetensors and .gguf files
     =============================================================================
+    Supports both .safetensors and .gguf model files with automatic detection.
+    GGUF files will trigger 5D tensor reshaping logic.
     """
     @classmethod
     def INPUT_TYPES(cls):
+        # Get list of model files (both .safetensors and .gguf) from FlashVSR directories
+        model_versions = ["FlashVSR", "FlashVSR-v1.1"]
+        model_files = []
+        seen_files = set()
+        
+        try:
+            # Scan both FlashVSR directories for model files
+            for version in model_versions:
+                model_path = os.path.join(folder_paths.models_dir, version)
+                if os.path.exists(model_path):
+                    for file in os.listdir(model_path):
+                        # Include both .safetensors and .gguf files
+                        if (file.endswith(".safetensors") or file.endswith(".gguf")) and file not in seen_files:
+                            model_files.append(file)
+                            seen_files.add(file)
+        except (OSError, AttributeError):
+            pass
+        
+        # If no files found, provide default fallback
+        if not model_files:
+            model_files = ["diffusion_pytorch_model_streaming_dmd.safetensors"]
+        
         return {
             "required": {
-                "model": (["FlashVSR", "FlashVSR-v1.1"], {
+                "model_version": (model_versions, {
                     "default": "FlashVSR-v1.1",
-                    "tooltip": "Select the FlashVSR model version. V1.1 is recommended for better stability."
+                    "tooltip": "Select the FlashVSR model directory (FlashVSR or FlashVSR-v1.1)."
+                }),
+                "model_file": (model_files, {
+                    "default": model_files[0] if model_files else "diffusion_pytorch_model_streaming_dmd.safetensors",
+                    "tooltip": "Select the model file to load (.safetensors or .gguf). GGUF files will use 5D tensor reshaping."
                 }),
                 "mode": (["tiny", "tiny-long", "full"], {
                     "default": "tiny",
@@ -1337,9 +1379,9 @@ class FlashVSRNodeInitPipe:
     RETURN_NAMES = ("pipe",)
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
-    DESCRIPTION = 'Initializes the FlashVSR pipeline. 5 VAE options: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5. Auto-downloads missing files.'
+    DESCRIPTION = 'Initializes the FlashVSR pipeline with dynamic file selection. Supports both .safetensors and .gguf files. 5 VAE options: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5.'
     
-    def main(self, model, mode, vae_model, force_offload, precision, device, attention_mode):
+    def main(self, model_version, model_file, mode, vae_model, force_offload, precision, device, attention_mode):
         _device = device
         if device == "auto":
             _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -1370,8 +1412,8 @@ class FlashVSRNodeInitPipe:
         except:
             dtype = torch.bfloat16
 
-        # Use unified vae_model parameter
-        pipe = init_pipeline(model, mode, _device, dtype, vae_model=vae_model)
+        # Use unified pipeline initialization with selected model file
+        pipe = init_pipeline(model_version, mode, _device, dtype, vae_model=vae_model, model_file=model_file)
         # FIX 10: Store mode with pipe for unified processing logic
         return((pipe, force_offload, mode),)
 
