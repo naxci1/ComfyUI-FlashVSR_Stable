@@ -63,7 +63,7 @@ def load_state_dict_from_folder(file_path, torch_dtype=None):
     state_dict = {}
     for file_name in os.listdir(file_path):
         if "." in file_name and file_name.split(".")[-1] in [
-            "safetensors", "bin", "ckpt", "pth", "pt"
+            "safetensors", "bin", "ckpt", "pth", "pt", "gguf"
         ]:
             state_dict.update(load_state_dict(os.path.join(file_path, file_name), torch_dtype=torch_dtype))
     return state_dict
@@ -72,6 +72,8 @@ def load_state_dict_from_folder(file_path, torch_dtype=None):
 def load_state_dict(file_path, torch_dtype=None):
     if file_path.endswith(".safetensors"):
         return load_state_dict_from_safetensors(file_path, torch_dtype=torch_dtype)
+    elif file_path.endswith(".gguf"):
+        return load_state_dict_from_gguf(file_path, torch_dtype=torch_dtype)
     else:
         return load_state_dict_from_bin(file_path, torch_dtype=torch_dtype)
 
@@ -92,6 +94,83 @@ def load_state_dict_from_bin(file_path, torch_dtype=None):
         for i in state_dict:
             if isinstance(state_dict[i], torch.Tensor):
                 state_dict[i] = state_dict[i].to(torch_dtype)
+    return state_dict
+
+
+def load_state_dict_from_gguf(file_path, torch_dtype=None):
+    """
+    Load state_dict from GGUF file with support for 5D tensors.
+    
+    GGUF files may contain flattened 5D tensors with their original shape
+    stored in metadata as 'raw_shape'. This function automatically reshapes
+    such tensors back to their original 5D dimensions.
+    
+    Args:
+        file_path: Path to the GGUF file
+        torch_dtype: Optional target dtype for tensors
+        
+    Returns:
+        Dictionary mapping tensor names to tensors
+    """
+    try:
+        import gguf
+    except ImportError:
+        raise ImportError(
+            "gguf library is required to load GGUF files. "
+            "Install it with: pip install gguf"
+        )
+    
+    from .tensor_utils import process_gguf_tensor
+    
+    print(f"Loading GGUF file: {file_path}")
+    
+    # Read GGUF file
+    reader = gguf.GGUFReader(file_path)
+    
+    state_dict = {}
+    
+    # Process each tensor in the GGUF file
+    for tensor in reader.tensors:
+        tensor_name = tensor.name
+        
+        # Get tensor data as numpy array
+        tensor_data = tensor.data
+        
+        # Convert to torch tensor
+        torch_tensor = torch.from_numpy(tensor_data.copy())
+        
+        # Get tensor metadata (may contain raw_shape for 5D tensors)
+        tensor_metadata = {}
+        
+        # Check if this tensor has raw_shape metadata
+        # GGUF stores per-tensor metadata in the fields
+        for field in reader.fields.values():
+            # Look for metadata related to this tensor
+            field_name = field.name
+            if field_name.endswith(f".{tensor_name}.raw_shape"):
+                # Extract raw_shape from metadata
+                tensor_metadata['raw_shape'] = field.parts[field.data]
+                break
+            elif field_name == f"{tensor_name}.raw_shape":
+                tensor_metadata['raw_shape'] = field.parts[field.data]
+                break
+        
+        # Alternative: Check tensor's own metadata if available
+        if hasattr(tensor, 'metadata') and tensor.metadata:
+            if 'raw_shape' in tensor.metadata:
+                tensor_metadata['raw_shape'] = tensor.metadata['raw_shape']
+        
+        # Process tensor (reshape if needed based on metadata)
+        processed_tensor = process_gguf_tensor(torch_tensor, tensor_metadata, tensor_name)
+        
+        # Apply dtype conversion if requested
+        if torch_dtype is not None:
+            processed_tensor = processed_tensor.to(torch_dtype)
+        
+        state_dict[tensor_name] = processed_tensor
+        
+    print(f"  Loaded {len(state_dict)} tensors from GGUF file")
+    
     return state_dict
 
 
