@@ -14,11 +14,9 @@ import folder_paths
 try:
     from .src.models.utils import load_state_dict
     from .src.models.model_manager import ModelManager
-    from .src.models.tensor_utils import has_raw_shape_metadata, validate_5d_tensor_shape
 except ImportError:
     from src.models.utils import load_state_dict
     from src.models.model_manager import ModelManager
-    from src.models.tensor_utils import has_raw_shape_metadata, validate_5d_tensor_shape
 
 
 class FlashVSR_GGUF_Loader:
@@ -34,14 +32,16 @@ class FlashVSR_GGUF_Loader:
         """Define input parameters for the ComfyUI node."""
         # Get list of GGUF files from checkpoints folder
         gguf_files = []
+        seen_files = set()
         try:
             checkpoints_dir = folder_paths.get_folder_paths("checkpoints")
             for checkpoint_dir in checkpoints_dir:
                 if os.path.exists(checkpoint_dir):
                     for file in os.listdir(checkpoint_dir):
-                        if file.endswith(".gguf"):
+                        if file.endswith(".gguf") and file not in seen_files:
                             gguf_files.append(file)
-        except:
+                            seen_files.add(file)
+        except (OSError, AttributeError):
             pass
         
         if not gguf_files:

@@ -6,8 +6,7 @@ This module provides functions to detect and reshape flattened tensors back to t
 """
 
 import torch
-import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple
 
 
 def has_raw_shape_metadata(tensor_metadata: dict) -> bool:
@@ -52,6 +51,9 @@ def reshape_flattened_tensor(tensor: torch.Tensor, raw_shape: Tuple[int, ...],
     """
     if not isinstance(raw_shape, (list, tuple)):
         raise ValueError(f"raw_shape must be a list or tuple, got {type(raw_shape)}")
+    
+    # Validate the shape before reshaping
+    validate_5d_tensor_shape(raw_shape, tensor_name)
     
     # Calculate expected total elements
     expected_size = 1
@@ -99,10 +101,9 @@ def process_gguf_tensor(tensor: torch.Tensor, tensor_metadata: dict,
     if has_raw_shape_metadata(tensor_metadata):
         raw_shape = tensor_metadata['raw_shape']
         
-        # Only reshape if raw_shape indicates 5D
-        if len(raw_shape) == 5:
-            print(f"  Reshaping tensor '{tensor_name}' from {tensor.shape} to {raw_shape}")
-            return reshape_flattened_tensor(tensor, raw_shape, tensor_name)
+        # Reshape (has_raw_shape_metadata already validates it's 5D)
+        print(f"  Reshaping tensor '{tensor_name}' from {tensor.shape} to {raw_shape}")
+        return reshape_flattened_tensor(tensor, raw_shape, tensor_name)
     
     # No reshaping needed
     return tensor

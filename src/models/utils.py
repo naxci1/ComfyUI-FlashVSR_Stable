@@ -105,6 +105,9 @@ def load_state_dict_from_gguf(file_path, torch_dtype=None):
     stored in metadata as 'raw_shape'. This function automatically reshapes
     such tensors back to their original 5D dimensions.
     
+    Note: The metadata format for 5D tensors should be stored in the GGUF file
+    with tensor-specific metadata keys like '<tensor_name>.raw_shape'.
+    
     Args:
         file_path: Path to the GGUF file
         torch_dtype: Optional target dtype for tensors
@@ -129,9 +132,26 @@ def load_state_dict_from_gguf(file_path, torch_dtype=None):
     
     state_dict = {}
     
+    # Build metadata map from GGUF fields
+    # GGUF stores metadata in key-value pairs in the header
+    metadata_map = {}
+    if hasattr(reader, 'fields') and reader.fields:
+        for field_key, field_value in reader.fields.items():
+            # Check if this is a tensor-specific metadata field
+            # Format should be like: "tensor_name.raw_shape"
+            if '.raw_shape' in str(field_key):
+                tensor_name = str(field_key).replace('.raw_shape', '')
+                # Extract the actual value from the field
+                if hasattr(field_value, 'parts') and hasattr(field_value, 'data'):
+                    # GGUF stores values in field.parts[field.data]
+                    metadata_map[tensor_name] = {'raw_shape': field_value.parts[field_value.data]}
+                elif hasattr(field_value, 'value'):
+                    # Alternative: field.value
+                    metadata_map[tensor_name] = {'raw_shape': field_value.value}
+    
     # Process each tensor in the GGUF file
     for tensor in reader.tensors:
-        tensor_name = tensor.name
+        tensor_name = str(tensor.name)
         
         # Get tensor data as numpy array
         tensor_data = tensor.data
@@ -139,26 +159,17 @@ def load_state_dict_from_gguf(file_path, torch_dtype=None):
         # Convert to torch tensor
         torch_tensor = torch.from_numpy(tensor_data.copy())
         
-        # Get tensor metadata (may contain raw_shape for 5D tensors)
+        # Get tensor metadata
         tensor_metadata = {}
         
-        # Check if this tensor has raw_shape metadata
-        # GGUF stores per-tensor metadata in the fields
-        for field in reader.fields.values():
-            # Look for metadata related to this tensor
-            field_name = field.name
-            if field_name.endswith(f".{tensor_name}.raw_shape"):
-                # Extract raw_shape from metadata
-                tensor_metadata['raw_shape'] = field.parts[field.data]
-                break
-            elif field_name == f"{tensor_name}.raw_shape":
-                tensor_metadata['raw_shape'] = field.parts[field.data]
-                break
-        
-        # Alternative: Check tensor's own metadata if available
+        # First check if tensor has its own metadata attribute
         if hasattr(tensor, 'metadata') and tensor.metadata:
             if 'raw_shape' in tensor.metadata:
                 tensor_metadata['raw_shape'] = tensor.metadata['raw_shape']
+        
+        # Fall back to metadata map built from fields
+        if not tensor_metadata and tensor_name in metadata_map:
+            tensor_metadata = metadata_map[tensor_name]
         
         # Process tensor (reshape if needed based on metadata)
         processed_tensor = process_gguf_tensor(torch_tensor, tensor_metadata, tensor_name)

@@ -12,4 +12,4 @@ sageattention
 flash-attn --no-build-isolation; platform_system!="Windows"
 psutil
 opencv-python>=4.8.1.78
-gguf
+gguf>=0.1.0
